@@ -1,0 +1,79 @@
+# IndustryScope 行业深研生成器
+
+一个部署在 Streamlit 上的行业深度研究工具。输入行业名称和研究参数后，工具会生成一篇带可点击引用、引用审计表和 HTML 下载的深度研报。
+
+工具支持多模型提供方：
+
+- OpenAI Responses：使用 OpenAI 官方 `web_search` 工具检索公开资料。
+- DeepSeek：使用 DeepSeek OpenAI-compatible Chat Completions；工具先本地检索/抓取网页，再把来源上下文交给模型。
+- Anthropic：默认 Base URL 可指向 qweapi；Claude/Opus 模型走 Anthropic Messages，`gpt-5.5` 等 GPT 模型自动走 OpenAI Chat Completions，工具先本地检索/抓取网页，再把来源上下文交给模型。
+- OpenAI 兼容接口：适配其他兼容 Chat Completions 的服务商，同样使用本地检索/抓取来源上下文。
+
+## 快速运行
+
+```powershell
+python -m pip install -r requirements.txt
+streamlit run app.py
+```
+
+可在侧边栏填写 `OPENAI_API_KEY`，也可以通过环境变量配置：
+
+```powershell
+$env:OPENAI_API_KEY="sk-..."
+$env:OPENAI_MODEL="gpt-5.1"
+streamlit run app.py
+```
+
+DeepSeek 配置示例：
+
+```powershell
+$env:DEEPSEEK_API_KEY="sk-..."
+$env:DEEPSEEK_BASE_URL="https://api.deepseek.com"
+$env:DEEPSEEK_MODEL="deepseek-v4-flash"
+streamlit run app.py
+```
+
+OpenAI-compatible 配置示例：
+
+```powershell
+$env:OPENAI_COMPAT_API_KEY="..."
+$env:OPENAI_COMPAT_BASE_URL="https://your-provider.example/v1"
+$env:OPENAI_COMPAT_MODEL="your-model"
+streamlit run app.py
+```
+
+Anthropic / qweapi 配置示例：
+
+```powershell
+$env:QWEAPI_AUTH_TOKEN="sk-..."
+$env:QWEAPI_BASE_URL="https://qweapi.com"
+$env:QWEAPI_MODEL="claude-opus-4-8"
+$env:QWEAPI_MODEL_DEEP="claude-opus-4-8[1M]"
+streamlit run app.py
+```
+
+在侧边栏选择 `Anthropic` 后，可直接选择：
+
+- `claude-opus-4-8`
+- `claude-opus-4-8[1M]`
+- `gpt-5.5`
+
+## 设计文档
+
+工具的详细设计、参考报告分析和增强点见：
+
+- `outputs/行业研究工具设计说明.md`
+
+## 主要能力
+
+- 输入行业后生成结构化深度研报
+- 支持 OpenAI / DeepSeek / OpenAI-compatible provider
+- 使用 OpenAI hosted search 或本地网页检索取得公开资料
+- 借鉴 GPT Researcher / open_deep_research / STORM / deep-research 的研究工作流：研究计划、多视角提纲、迭代检索、来源审计、结论审计
+- 本地检索会按相关性与来源权威性排序，并过滤电商、歌词、视频、地图、登录页等低价值来源
+- 可默认优先检索微信公众号文章，用于发现中国市场产业线索；公众号来源会被标注为需复核，不单独支撑强结论
+- 可选使用 `trafilatura` 做网页正文抽取，失败时回退 BeautifulSoup
+- 强制输出可点击引用
+- HTML 单文件导出
+- 引用审计表与质量检查
+- 无 API Key 时提供本地示例报告，方便预览样式
