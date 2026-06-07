@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Any
+from xml.etree import ElementTree as ET
 
 import markdown as markdown_lib
 import requests
@@ -113,11 +114,23 @@ OPEN_SOURCE_RESEARCH_METHODS = """
 """
 
 
+RECENCY_AND_DEEP_SIGNAL_RULES = """
+最新信息与深信号挖掘规则（必须执行）：
+1. 不得依赖模型内置知识截止日期做最新判断。当前日期之后不可写成事实；当前日期之前但模型可能未知的内容，必须以实时来源或用户指定来源为准。
+2. 报告必须优先检索并审计最近 180 天、最近 90 天和最近 30 天的公开信息：公司公告、投资者材料、专利、论文、招聘、会议、供应链订单、客户认证、媒体采访、微信公众号产业文章。
+3. 每个行业都必须做“隐藏拐点/深信号”挖掘，不得只停留在市场规模和竞争格局。必须追问：真正限制产品性能或商业化的材料、界面、工艺、设备、良率、可靠性、封装、算法、数据、认证、供应商和客户导入分别是什么。
+4. 任何产品型行业必须拆成“材料/核心部件/传感或执行器/芯片或控制器/封装或结构件/软件算法/数据校准/量产测试/客户认证”九层；任何制造型行业必须拆成“基材/设备/关键工艺/良率/检测/产能/客户认证/成本曲线/替代路线”九层。
+5. 对疑似关键拐点，必须输出“深信号候选表”：候选拐点、为什么可能重要、证据来源、反证、需要继续核验的关键词。即使证据不足，也要把它列为待核验假设，而不是漏掉。
+6. 示例：肌电/EMG 手环不能只写 AI 交互和 Meta 产品演示，必须检索 dry electrode、skin-electrode interface、impedance、diamond-like carbon/DLC、biocompatibility、sweat/durability、CTRL-Labs/Meta neural wristband、patent/paper 等关键词；玻璃基板封装不能只写先进封装需求，必须检索 glass core substrate、TGV、panel-level packaging、warpage、CTE、RDL、TSMC/Intel/Samsung/玻璃通孔/最新动作。
+7. 如果检索没有发现用户认为重要的材料/工艺/拐点，报告必须在“待核验清单”中显式写出“未找到足够证据，不得据此断言不存在”。
+"""
+
+
 SECTION_TASKS = """
 分章任务卡（每章都要按任务执行）：
 
-## 研究边界与立场
-写一段“为什么这个行业边界容易被误读”。定义核心对象、价值链位置、包含/排除范围、相邻概念映射表。对于相邻概念，说明它们是上游、下游、替代、互补还是不同统计口径。
+## 研究边界与多立场框架
+写一段“为什么这个行业边界容易被误读”。定义核心对象、价值链位置、包含/排除范围、相邻概念映射表。对于相邻概念，说明它们是上游、下游、替代、互补还是不同统计口径。随后输出多立场问题矩阵，必须同时覆盖 PE/VC、产业方、二级市场、战略咨询、技术评估、客户/采购方、怀疑者/空头七种视角。
 
 ## 核心问题
 提出 5-7 个真正影响投资判断的问题，覆盖：需求确定性、技术路线胜率、供应链瓶颈、竞争格局、利润池、估值/退出、监管/地缘。每个问题说明为什么它重要。
@@ -127,6 +140,12 @@ SECTION_TASKS = """
 
 ## 执行摘要
 输出 6-8 条结论，每条必须包含：一句话判断、2-3 个可点击证据、置信度、最大反证/失败条件、未来 6-18 个月要跟踪的信号。禁止没有证据的口号式结论。
+
+## 深信号与隐藏拐点
+必须输出表格：深信号候选、所属层级（材料/工艺/部件/封装/算法/客户认证/供应链/政策/其他）、为什么可能是行业拐点、支持证据、反证或不确定性、下一步核验关键词。不要因为证据不足就省略候选，证据不足时标注“待核验假设”。
+
+## 最新动作与信息时效
+必须列出最近 180 天、90 天、30 天内找到的关键更新；若未找到，写明检索过哪些关键词和来源类型。对 2026 年以来的新公司动作、客户导入、产线、政策、专利、论文、会议披露必须优先纳入。
 
 ## 历史沿革
 不是堆时间线。每个里程碑必须说明“它改变了什么约束”：成本、性能、良率、客户采用、政策、资本化。技术史和商业史分开，不要把论文突破等同于量产。
@@ -178,10 +197,12 @@ REPORT_OUTLINE = """
 # {industry}深度研究报告
 
 ## 封面与元信息
-## 研究边界与立场
+## 研究边界与多立场框架
 ## 本报告要回答的核心问题
 ## 研究计划与检索策略
 ## 执行摘要
+## 深信号与隐藏拐点
+## 最新动作与信息时效
 ## 技术/产业历史沿革
 ## 当前水平与核心瓶颈
 ## 市场规模、口径冲突与需求驱动
@@ -385,7 +406,6 @@ class ReportRequest:
     provider: str
     industry: str
     region: str
-    stance: str
     depth: str
     focus_questions: str
     source_urls: str
@@ -398,6 +418,10 @@ class ReportRequest:
     timeout_seconds: int = 900
     max_local_sources: int = 8
     prefer_wechat: bool = True
+
+    @property
+    def stance(self) -> str:
+        return "全立场覆盖（PE/VC、产业方、二级市场、战略咨询、技术评估、客户/采购方、怀疑者/空头）"
 
 
 def build_prompt(req: ReportRequest) -> str:
@@ -434,9 +458,11 @@ def build_prompt(req: ReportRequest) -> str:
 
 {OPEN_SOURCE_RESEARCH_METHODS}
 
+{RECENCY_AND_DEEP_SIGNAL_RULES}
+
 {SECTION_TASKS}
 
-请优先搜索 2024-2026 年最新资料；涉及历史沿革时可使用更早资料。
+请优先搜索 2024-2026 年最新资料，尤其是当前日期之前最近 180/90/30 天的新动作；涉及历史沿革时可使用更早资料。你的模型内置知识可能早于当前日期，因此所有“最新、最近、今年、上月、本月、新动作”都必须以实时来源或用户指定来源为准。
 请主动检索中英文资料，全球行业优先英文一手来源，中国专项优先中文官方/公告/主流财经来源；若开启微信公众号优先，公众号可用于发现产业链线索、访谈、公司动态和中文语境中的争议点，但必须在引用审计中降权并说明待核验项。
 如果来源之间数字冲突，请不要强行统一，必须列出冲突口径并给出你采用的口径。
 
@@ -504,7 +530,7 @@ def call_openai(req: ReportRequest, api_key: str) -> tuple[str, list[dict[str, s
 
 def search_public_web(req: ReportRequest, max_results: int = 12) -> list[dict[str, str]]:
     """Collect public source candidates for providers without hosted web search."""
-    deadline = time.monotonic() + 18
+    deadline = time.monotonic() + {"快速版": 18, "标准版": 28, "深度版": 42}.get(req.depth, 28)
     aliases = industry_search_aliases(req.industry)
     queries = build_research_queries(req, aliases)
     results: list[dict[str, str]] = []
@@ -558,8 +584,22 @@ def search_public_web(req: ReportRequest, max_results: int = 12) -> list[dict[st
     for item in curated_source_candidates(req.industry):
         add(item["title"], item["url"], item.get("snippet", ""))
 
-    query_limit = {"快速版": 6, "标准版": 10, "深度版": 14}.get(req.depth, 10)
+    query_limit = {"快速版": 8, "标准版": 16, "深度版": 26}.get(req.depth, 16)
     for query in queries[:query_limit]:
+        if time.monotonic() > deadline:
+            break
+        try:
+            for item in google_news_rss_search(query):
+                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""))
+        except Exception:
+            pass
+        if time.monotonic() > deadline:
+            break
+        try:
+            for item in arxiv_search(query):
+                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""))
+        except Exception:
+            pass
         if time.monotonic() > deadline:
             break
         try:
@@ -596,6 +636,30 @@ def industry_search_aliases(industry: str) -> list[str]:
             "CPO co-packaged optics",
             "optical transceiver",
         ])
+    if any(term in industry for term in ["肌电", "肌電", "手环", "手環", "神经腕带", "腕带"]) or any(term in lowered for term in ["emg", "electromyography", "neural wristband"]):
+        aliases.extend([
+            "EMG wristband",
+            "electromyography wristband",
+            "neural wristband",
+            "surface EMG",
+            "sEMG dry electrode",
+            "skin electrode interface",
+            "diamond-like carbon electrode",
+            "DLC electrode",
+            "Meta neural wristband",
+            "CTRL-Labs wristband",
+        ])
+    if any(term in industry for term in ["玻璃基板", "玻璃基板封装", "玻璃封装", "先进封装"]) or any(term in lowered for term in ["glass substrate", "glass core", "advanced packaging"]):
+        aliases.extend([
+            "glass core substrate",
+            "glass substrate advanced packaging",
+            "glass interposer",
+            "through glass via",
+            "TGV glass substrate",
+            "panel level packaging glass substrate",
+            "RDL glass substrate",
+            "TSMC glass substrate packaging",
+        ])
     return list(dict.fromkeys([item for item in aliases if item.strip()]))
 
 
@@ -603,6 +667,7 @@ def build_research_queries(req: ReportRequest, aliases: list[str]) -> list[str]:
     """Research-plan style queries inspired by GPT Researcher/deep-research."""
     core = " ".join(aliases[:3])
     primary = aliases[1] if len(aliases) > 1 else req.industry
+    year_month = datetime.now().strftime("%Y-%m")
     wechat_queries = []
     if req.prefer_wechat:
         wechat_queries = [
@@ -610,17 +675,29 @@ def build_research_queries(req: ReportRequest, aliases: list[str]) -> list[str]:
             f"site:mp.weixin.qq.com {req.industry} 技术路线 竞争格局 投融资",
             f"site:mp.weixin.qq.com {req.industry} 产业纪要 专家访谈 客户验证",
             f"site:mp.weixin.qq.com {req.industry} 国产替代 风险 反证",
+            f"site:mp.weixin.qq.com {req.industry} 材料 工艺 瓶颈 良率 客户认证",
+            f"site:mp.weixin.qq.com {req.industry} 专利 论文 拆解 供应链 最新",
             f"{req.industry} 微信公众号 深度研究 行业报告",
         ]
-    queries = wechat_queries + [
+    deep_signal_queries = build_deep_signal_queries(req, aliases)
+    queries = wechat_queries + deep_signal_queries + [
+        f"{req.industry} 最新 进展 动作 {year_month} 2026",
+        f"{req.industry} 最近 30 天 90 天 180 天 公司 动作 2026",
         f"{req.industry} 技术路线 市场规模 产业链 竞争格局 2026",
         f"{req.industry} 白皮书 行业报告 年报 招股书 2025 2026",
         f"{req.industry} 政策 监管 标准 产业规划 2025 2026",
         f"{req.industry} 投融资 并购 IPO 估值 2025 2026",
         f"{req.industry} 上市公司 年报 财报 投资者关系 2025 2026",
         f"{req.industry} 失败 风险 瓶颈 良率 成本 客户认证",
+        f"{req.industry} 材料 工艺 设备 良率 可靠性 封装 量产 瓶颈",
+        f"{req.industry} 专利 论文 会议 招聘 供应商 客户认证",
+        f"{req.industry} 拆解 teardown BOM 关键材料 关键部件",
+        f"{req.industry} hidden bottleneck key material process patent",
         f"{core} market size forecast CAGR industry report 2026",
+        f"{core} latest news company update 2026",
         f"{core} technology roadmap bottleneck yield cost 2025 2026",
+        f"{core} materials process reliability patent paper 2024 2025 2026",
+        f"{core} teardown bill of materials key component supplier",
         f"{core} leading companies annual report investor presentation 2025 2026",
         f"{core} supply chain value chain profit pool customer adoption",
         f"{core} standards policy export control regulation",
@@ -641,8 +718,49 @@ def build_research_queries(req: ReportRequest, aliases: list[str]) -> list[str]:
     return list(dict.fromkeys(queries))
 
 
+def build_deep_signal_queries(req: ReportRequest, aliases: list[str]) -> list[str]:
+    industry = req.industry
+    lowered = " ".join([industry] + aliases).lower()
+    queries: list[str] = []
+    if any(term in industry for term in ["肌电", "肌電", "手环", "手環", "神经腕带", "腕带"]) or any(term in lowered for term in ["emg", "electromyography", "neural wristband"]):
+        queries.extend([
+            "Meta neural wristband EMG electrode diamond-like carbon DLC",
+            "\"diamond-like carbon\" \"EMG\" electrode wristband",
+            "\"DLC\" \"dry electrode\" \"EMG\" wristband",
+            "\"skin-electrode interface\" \"surface EMG\" dry electrode impedance",
+            "CTRL-Labs Meta neural wristband electrode patent",
+            "Meta Reality Labs EMG wristband dry electrode patent",
+            "surface EMG dry electrode material impedance sweat durability review 2024 2025",
+            "sEMG wearable dry electrodes diamond like carbon biocompatibility",
+            "site:patents.google.com Meta EMG wristband electrode",
+            "site:patents.google.com CTRL-Labs wristband electrode EMG",
+            "site:tech.facebook.com EMG wristband electrode",
+            "site:about.meta.com neural wristband EMG electrode",
+            "site:mp.weixin.qq.com 肌电 手环 电极 材料 DLC 类金刚石碳",
+            "site:mp.weixin.qq.com Meta 肌电手环 电极 材料 神经腕带",
+        ])
+    if any(term in industry for term in ["玻璃基板", "玻璃基板封装", "玻璃封装", "先进封装"]) or any(term in lowered for term in ["glass substrate", "glass core", "advanced packaging"]):
+        queries.extend([
+            "TSMC glass substrate advanced packaging 2026 latest",
+            "TSMC glass core substrate CoWoS advanced packaging 2026",
+            "台积电 玻璃基板 先进封装 2026 最新 动作",
+            "台积电 玻璃通孔 TGV 玻璃基板 封装",
+            "glass core substrate TGV panel level packaging warpage CTE RDL 2026",
+            "Intel glass substrate advanced packaging 2030 TGV RDL",
+            "Samsung glass substrate advanced packaging 2026",
+            "Ajinomoto glass core substrate advanced packaging",
+            "Corning glass substrate semiconductor packaging TGV",
+            "abf substrate vs glass core substrate advanced packaging bottleneck",
+            "site:mp.weixin.qq.com 玻璃基板 封装 台积电 TGV 最新",
+            "site:mp.weixin.qq.com 玻璃基板 先进封装 产业链 良率 翘曲",
+        ])
+    return queries
+
+
 def is_low_value_domain(host: str) -> bool:
     if "mp.weixin.qq.com" in host:
+        return False
+    if host in {"patents.google.com", "scholar.google.com", "news.google.com"}:
         return False
     low_value_domains = [
         "youtube.com", "youtu.be", "google.com", "google.com.mx", "maps.google.com",
@@ -650,6 +768,7 @@ def is_low_value_domain(host: str) -> bool:
         "twitter.com", "reddit.com", "quora.com", "genius.com", "lyrics.com",
         "yelp.com", "yellowpages.com", "cars.com", "claycooley.com", "off---white.com",
         "off-white.com", "xfinity.com", "comcast.com",
+        "baike.baidu.com", "wikipedia.org", "wikiwand.com",
     ]
     return any(host == domain or host.endswith("." + domain) for domain in low_value_domains)
 
@@ -669,6 +788,16 @@ def source_relevance_score(industry: str, title: str, url: str, snippet: str = "
         "co-packaged", "copackaged", "cpo", "pic", "laser", "modulator", "datacenter",
         "data center", "foundry", "wafer", "chip", "chiplet", "光子", "硅光", "光芯片",
         "光模块", "光通信", "光电", "半导体", "晶圆", "封装",
+        "material", "materials", "process", "patent", "paper", "review", "roadmap",
+        "yield", "reliability", "impedance", "electrode", "interface", "sensor",
+        "substrate", "interposer", "via", "rdl", "packaging", "supplier", "customer",
+        "certification", "qualification", "recruiting", "job", "conference", "teardown",
+        "材料", "工艺", "专利", "论文", "综述", "良率", "可靠性", "阻抗", "电极",
+        "界面", "传感器", "基板", "通孔", "供应商", "客户认证", "招聘", "会议", "拆解",
+        "最新", "进展", "动作", "量产", "试产", "产线",
+        "emg", "semg", "electromyography", "wristband", "neural", "dlc", "diamond-like carbon",
+        "dry electrode", "skin-electrode", "肌电", "手环", "腕带", "类金刚石碳", "干电极",
+        "glass core", "glass substrate", "through glass via", "tgv", "panel-level", "玻璃基板", "玻璃通孔",
     ]
     score += sum(1 for term in domain_terms if term in text)
 
@@ -679,6 +808,9 @@ def source_relevance_score(industry: str, title: str, url: str, snippet: str = "
         "grandviewresearch.com", "imarcgroup.com", "intel.com", "cisco.com", "broadcom.com",
         "marvell.com", "coherent.com", "lumentum.com", "synopsys.com", "cadence.com",
         "tsmc.com", "imec-int.com", "imec.be", "imec.org", "ofcconference.org",
+        "patents.google.com", "uspto.gov", "wipo.int", "acm.org", "mdpi.com",
+        "about.meta.com", "tech.facebook.com", "ai.meta.com", "realitylabs.com",
+        "samsung.com", "corning.com", "ajinomoto.com",
         "caict.ac.cn", "miit.gov.cn", "sse.com.cn", "szse.cn", "hkexnews.hk",
     ]
     if any(token in host for token in high_quality_hosts):
@@ -734,11 +866,15 @@ def source_authority_score(url: str) -> int:
         score += 6
     if any(token in host for token in ["ieee.org", "nature.com", "science.org", "springer.com", "spiedigitallibrary.org", "arxiv.org"]):
         score += 5
+    if any(token in host for token in ["patents.google.com", "uspto.gov", "wipo.int"]):
+        score += 5
+    if any(token in host for token in ["about.meta.com", "tech.facebook.com", "ai.meta.com", "tsmc.com", "intel.com", "samsung.com", "corning.com"]):
+        score += 4
     if any(token in host for token in ["yolegroup.com", "lightcounting.com", "omdia.com", "idc.com", "gartner.com", "marketsandmarkets.com"]):
         score += 4
     if any(token in host for token in ["investor", "annualreports.com"]) or any(token in path for token in ["annual", "10-k", "investor", "presentation"]):
         score += 3
-    if any(token in path for token in ["search", "login", "signin", "privacy", "terms"]):
+    if any(token in path for token in ["login", "signin", "privacy", "terms"]) or re.search(r"(^|/)search($|/)", path):
         score -= 3
     return score
 
@@ -754,6 +890,8 @@ def classify_source_type(url: str) -> str:
         return "S 监管公告/交易所披露"
     if any(token in host for token in ["ieee.org", "nature.com", "science.org", "springer.com", "spiedigitallibrary.org", "arxiv.org"]):
         return "S 论文/学术资料"
+    if any(token in host for token in ["patents.google.com", "uspto.gov", "wipo.int"]):
+        return "S 专利/知识产权"
     if any(token in host for token in ["investor", "annualreports.com"]) or any(token in path for token in ["annual", "10-k", "investor", "presentation"]):
         return "S/A 公司披露"
     if any(token in host for token in ["yolegroup.com", "lightcounting.com", "omdia.com", "idc.com", "gartner.com", "marketsandmarkets.com", "grandviewresearch.com", "imarcgroup.com"]):
@@ -764,9 +902,77 @@ def classify_source_type(url: str) -> str:
 
 
 def curated_source_candidates(industry: str) -> list[dict[str, str]]:
+    lowered = industry.lower()
+    sources: list[dict[str, str]] = []
+    if any(term in industry for term in ["肌电", "肌電", "手环", "手環", "神经腕带", "腕带"]) or any(term in lowered for term in ["emg", "electromyography", "neural wristband"]):
+        sources.extend([
+            {
+                "title": "Meta Quest Blog - Control Shift: Reality Labs sEMG research in Nature",
+                "url": "https://www.meta.com/blog/quest/control-shift-new-reality-labs-research-semg-nature/",
+                "snippet": "Meta Reality Labs discusses surface EMG neural wristband research and human-computer interaction implications.",
+            },
+            {
+                "title": "Nature - A generic non-invasive neuromotor interface for human-computer interaction",
+                "url": "https://www.nature.com/articles/s41586-025-09128-4",
+                "snippet": "Nature paper on Meta Reality Labs non-invasive neuromotor interface using surface EMG.",
+            },
+            {
+                "title": "PMC review - Surface EMG electrodes and skin-electrode interface",
+                "url": "https://www.ncbi.nlm.nih.gov/pmc/?term=surface+EMG+dry+electrode+skin+electrode+interface",
+                "snippet": "Search entry for peer-reviewed literature on sEMG dry electrodes, impedance, sweat, durability, and skin-electrode interface.",
+            },
+            {
+                "title": "Google Patents search - Meta/CTRL-Labs EMG wristband electrodes",
+                "url": "https://patents.google.com/?q=(Meta+OR+CTRL-Labs)+EMG+wristband+electrode",
+                "snippet": "Patent search entry for Meta/CTRL-Labs EMG wristband electrode structures and materials.",
+            },
+            {
+                "title": "Google Patents search - diamond-like carbon EMG dry electrode",
+                "url": "https://patents.google.com/?q=%22diamond-like+carbon%22+EMG+dry+electrode",
+                "snippet": "Patent search entry for DLC/diamond-like carbon dry electrodes and EMG electrode material claims.",
+            },
+            {
+                "title": "Google Scholar search - diamond-like carbon dry electrodes EMG",
+                "url": "https://scholar.google.com/scholar?q=diamond-like+carbon+dry+electrode+EMG",
+                "snippet": "Academic search entry for DLC dry electrodes, biocompatibility, impedance, and wearable sEMG.",
+            },
+        ])
+    if any(term in industry for term in ["玻璃基板", "玻璃基板封装", "玻璃封装", "先进封装"]) or any(term in lowered for term in ["glass substrate", "glass core", "advanced packaging"]):
+        sources.extend([
+            {
+                "title": "Intel newsroom - Glass substrates for advanced packaging",
+                "url": "https://www.intel.com/content/www/us/en/newsroom/news/intel-unveils-industry-leading-glass-substrates.html",
+                "snippet": "Intel official announcement on glass substrates for next-generation advanced packaging.",
+            },
+            {
+                "title": "TSMC newsroom - advanced packaging and 2026 technology symposium search",
+                "url": "https://pr.tsmc.com/english/search?keywords=advanced%20packaging%20glass%20substrate",
+                "snippet": "TSMC official newsroom search entry for advanced packaging, CoWoS, glass substrate and latest company actions.",
+            },
+            {
+                "title": "TSMC investor relations - annual reports and advanced packaging disclosures",
+                "url": "https://investor.tsmc.com/english/annual-reports",
+                "snippet": "TSMC annual reports and investor materials for capital spending, advanced packaging and technology roadmap verification.",
+            },
+            {
+                "title": "TrendForce search - glass substrate advanced packaging",
+                "url": "https://www.trendforce.com/searchNews?query=glass%20substrate%20advanced%20packaging",
+                "snippet": "Industry news search entry for glass core substrates, TGV, panel-level packaging and supply chain moves.",
+            },
+            {
+                "title": "Semiconductor Engineering search - glass substrate packaging",
+                "url": "https://semiengineering.com/?s=glass+substrate+packaging",
+                "snippet": "Technical industry search entry for glass substrate packaging, warpage, CTE, RDL and panel-level process issues.",
+            },
+            {
+                "title": "Corning semiconductor packaging glass search",
+                "url": "https://www.corning.com/worldwide/en/search.html?q=semiconductor%20packaging%20glass%20substrate",
+                "snippet": "Corning official search entry for glass materials relevant to semiconductor packaging substrates.",
+            },
+        ])
     if not any(term in industry for term in ["硅光", "光芯片", "硅光芯片"]):
-        return []
-    return [
+        return sources
+    sources.extend([
         {
             "title": "Intel Silicon Photonics product overview",
             "url": "https://www.intel.com/content/www/us/en/products/details/network-io/silicon-photonics.html",
@@ -867,7 +1073,8 @@ def curated_source_candidates(industry: str) -> list[dict[str, str]]:
             "url": "https://www.cninfo.com.cn/new/disclosure/stock?stockCode=002281&orgId=9900007421",
             "snippet": "Chinese optical device and module company announcements; optical chip/device ecosystem context.",
         },
-    ]
+    ])
+    return sources
 
 
 def unwrap_search_url(url: str) -> str:
@@ -881,6 +1088,66 @@ def unwrap_search_url(url: str) -> str:
         if target:
             return unquote(target[0])
     return url
+
+
+def google_news_rss_search(query: str) -> list[dict[str, str]]:
+    response = requests.get(
+        "https://news.google.com/rss/search",
+        params={"q": query, "hl": "zh-CN", "gl": "CN", "ceid": "CN:zh-Hans"},
+        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml, application/xml;q=0.9, */*;q=0.8"},
+        timeout=8,
+    )
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    items: list[dict[str, str]] = []
+    for item in root.findall(".//item")[:8]:
+        title = item.findtext("title") or ""
+        link = item.findtext("link") or ""
+        pub_date = item.findtext("pubDate") or ""
+        source = item.findtext("source") or ""
+        items.append({
+            "title": title,
+            "url": link,
+            "snippet": f"Google News RSS; source={source}; pubDate={pub_date}",
+        })
+    return items
+
+
+def arxiv_search(query: str) -> list[dict[str, str]]:
+    terms = [term for term in re.findall(r"[A-Za-z][A-Za-z0-9\-]{2,}", query) if term.lower() not in {"and", "the", "with", "for", "latest", "company", "update"}]
+    if not terms:
+        return []
+    query_l = query.lower()
+    if not any(token in query_l for token in ["emg", "semg", "electromyography", "photonic", "substrate", "packaging", "glass", "electrode", "sensor", "semiconductor"]):
+        return []
+    search_query = " OR ".join(f"all:{term}" for term in terms[:5])
+    response = requests.get(
+        "http://export.arxiv.org/api/query",
+        params={"search_query": search_query, "start": 0, "max_results": 5, "sortBy": "submittedDate", "sortOrder": "descending"},
+        headers={"User-Agent": "IndustryScope/1.0"},
+        timeout=8,
+    )
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+    ns = {"atom": "http://www.w3.org/2005/Atom"}
+    items: list[dict[str, str]] = []
+    for entry in root.findall("atom:entry", ns):
+        title = " ".join((entry.findtext("atom:title", default="", namespaces=ns) or "").split())
+        link = ""
+        for candidate in entry.findall("atom:link", ns):
+            if candidate.attrib.get("rel") == "alternate":
+                link = candidate.attrib.get("href", "")
+                break
+        summary = " ".join((entry.findtext("atom:summary", default="", namespaces=ns) or "").split())
+        haystack = f"{title} {summary}".lower()
+        matched_terms = sum(1 for term in terms[:6] if term.lower() in haystack)
+        must_have = [token for token in ["emg", "semg", "electromyography", "electrode", "wristband", "substrate", "packaging", "glass", "tgv", "photonic"] if token in query_l]
+        has_must = not must_have or any(token in haystack for token in must_have)
+        if matched_terms < 3 or not has_must:
+            continue
+        published = entry.findtext("atom:published", default="", namespaces=ns) or ""
+        items.append({"title": title, "url": link, "snippet": f"arXiv published={published}; {summary[:320]}"})
+    return items
 
 
 def jina_search(query: str) -> list[dict[str, str]]:
@@ -1120,7 +1387,7 @@ def fetch_source_text(url: str, timeout: int = 15) -> str:
     return text
 
 
-def build_source_context(sources: list[dict[str, str]], industry: str = "", per_source_chars: int = 1800) -> str:
+def build_source_context(sources: list[dict[str, str]], industry: str = "", per_source_chars: int = 2400) -> str:
     blocks: list[str] = []
     for idx, source in enumerate(sources, start=1):
         text = ""
@@ -1152,7 +1419,7 @@ def build_source_context(sources: list[dict[str, str]], industry: str = "", per_
 
 
 def call_chat_compatible(req: ReportRequest, api_key: str) -> tuple[str, list[dict[str, str]], dict[str, Any]]:
-    default_sources = {"快速版": 6, "标准版": 10, "深度版": 14}.get(req.depth, 10)
+    default_sources = {"快速版": 8, "标准版": 16, "深度版": 24}.get(req.depth, 16)
     max_sources = min(req.max_local_sources, default_sources)
     sources = search_public_web(req, max_sources)
     source_context = build_source_context(sources, req.industry)
@@ -1265,7 +1532,7 @@ def post_anthropic_message(
 
 
 def build_chat_source_prompt(req: ReportRequest) -> tuple[str, list[dict[str, str]]]:
-    default_sources = {"快速版": 6, "标准版": 10, "深度版": 14}.get(req.depth, 10)
+    default_sources = {"快速版": 8, "标准版": 16, "深度版": 24}.get(req.depth, 16)
     max_sources = min(req.max_local_sources, default_sources)
     sources = search_public_web(req, max_sources)
     source_context = build_source_context(sources, req.industry)
@@ -1430,7 +1697,9 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
     has_limitations = "待核验" in markdown_text or "研究局限" in markdown_text
     has_failure = "失败条件" in markdown_text
     has_scenarios = all(x in markdown_text.lower() for x in ["bull", "base", "bear"])
-    has_multi_perspective = any(term in markdown_text for term in ["技术专家", "产业链", "客户", "采购方", "怀疑者", "空头"])
+    has_multi_perspective = any(term in markdown_text for term in ["PE/VC", "产业方", "二级市场", "战略咨询", "技术评估", "客户", "采购方", "怀疑者", "空头"])
+    has_deep_signals = any(term in markdown_text for term in ["深信号", "隐藏拐点", "关键材料", "关键工艺", "待核验假设"])
+    has_recency_section = any(term in markdown_text for term in ["最新动作", "信息时效", "最近 180 天", "最近180天", "最近 90 天", "最近90天", "最近 30 天", "最近30天"])
     has_rejected_sources = any(term in markdown_text for term in ["剔除来源", "低相关来源", "来源相关性审查"])
     strong_patterns = ["全球\\s*第一", "独家", "垄断", "唯一", "确定性\\s*极高", "必然", "毁灭性", "订单\\s*排至", "市占率\\s*第一"]
     strong_term_hits = []
@@ -1465,7 +1734,11 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
     if weak_source_hits and "证据强度" not in markdown_text:
         warnings.append("检测到弱来源名称，但缺少证据强度标注。")
     if not has_multi_perspective:
-        warnings.append("多视角审视不足，建议补充技术/客户/投资人/怀疑者视角。")
+        warnings.append("多立场审视不足，建议同时覆盖 PE/VC、产业方、二级市场、战略咨询、技术评估、客户/采购方、怀疑者视角。")
+    if not has_deep_signals:
+        warnings.append("未检测到深信号/隐藏拐点小节，可能漏掉材料、工艺、专利、客户认证等关键变量。")
+    if not has_recency_section:
+        warnings.append("未检测到最新动作/信息时效小节，可能漏掉最近 30/90/180 天更新。")
     if sources and not has_rejected_sources:
         warnings.append("未检测到来源相关性审查或剔除来源说明。")
     if len(evidence_hygiene_hits) < 3:
@@ -1482,6 +1755,8 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
         "has_failure_conditions": has_failure,
         "has_scenarios": has_scenarios,
         "has_multi_perspective": has_multi_perspective,
+        "has_deep_signals": has_deep_signals,
+        "has_recency_section": has_recency_section,
         "has_rejected_sources": has_rejected_sources,
         "strong_term_hits": strong_term_hits,
         "weak_source_hits": weak_source_hits,
@@ -1510,7 +1785,7 @@ def render_report_html(markdown_text: str, req: ReportRequest, sources: list[dic
     meta_items = [
         {"label": "行业", "value": req.industry},
         {"label": "研究范围", "value": req.region},
-        {"label": "分析立场", "value": req.stance},
+        {"label": "覆盖视角", "value": req.stance},
         {"label": "报告深度", "value": req.depth},
         {"label": "模型", "value": req.model},
         {"label": "生成时间", "value": datetime.now().strftime("%Y-%m-%d %H:%M")},
@@ -1544,15 +1819,25 @@ def sample_report(req: ReportRequest) -> tuple[str, list[dict[str, str]]]:
 - 报告日期：{datetime.now().strftime("%Y-%m-%d")}
 - 数据截止：示例模式，未进行实时完整检索
 - 研究范围：{req.region}
-- 分析立场：{req.stance}
+- 覆盖视角：{req.stance}
 - 报告版本：demo
 - 免责声明：本示例用于预览工具结构，不构成投资建议。
 
-## 研究边界与立场
+## 研究边界与多立场框架
 - 核心定义：围绕“{title}”的技术、产品、产业链、竞争格局与投资价值进行分析。
 - 包含范围：核心技术路线、关键公司、上游资源、下游应用、政策与资本市场信号。
 - 排除范围：与该行业弱相关的泛概念、无法核验的数据和无来源预测。
 - 本报告要回答的核心问题：行业处于什么阶段，瓶颈在哪里，谁掌握利润池，未来 6-24 个月看什么指标。
+- 多立场覆盖：PE/VC 看投资窗口和退出，产业方看供应链和客户导入，二级市场看财务弹性，战略咨询看竞争位置，技术评估看材料/工艺/良率，客户/采购方看可靠性和认证，怀疑者看反证。
+
+## 深信号与隐藏拐点
+| 深信号候选 | 所属层级 | 为什么重要 | 当前证据 | 下一步核验 |
+|---|---|---|---|---|
+| 关键材料/界面 | 材料/工艺 | 可能决定性能、寿命、良率和客户认证 | 示例模式不检索 | 正式模式会强制检索材料、专利、论文、拆解和供应链 |
+| 客户认证周期 | 商业化 | 决定收入兑现节奏 | 示例模式不检索 | 正式模式会检索公告、访谈、招聘、招标和客户导入 |
+
+## 最新动作与信息时效
+示例模式不进行实时检索。正式模式会优先检查最近 180/90/30 天的新动作，并以实时来源覆盖模型内置知识。
 
 ## 执行摘要
 1. **结论**：优秀行研的第一步不是写观点，而是先锁定边界与口径。**证据**：OpenAI 的 web search 工具要求最终展示给用户的 URL citation 清晰可见且可点击，见 [OpenAI Web Search docs]({links[0][1]})。**置信度**：高。**失败条件**：如果目标部署环境不能访问实时网页，需要改用私有资料库或文件上传。
@@ -1622,6 +1907,8 @@ def sample_report(req: ReportRequest) -> tuple[str, list[dict[str, str]]]:
 
 
 def request_from_session(data: dict[str, Any]) -> ReportRequest:
+    data = dict(data)
+    data.pop("stance", None)
     return ReportRequest(**data)
 
 

@@ -104,7 +104,7 @@ def sidebar_request() -> tuple[ReportRequest, str, bool]:
         region = st.selectbox("地域范围", ["全球+中国专项", "全球", "中国", "美国", "欧洲", "自定义"], index=0)
         if region == "自定义":
             region = st.text_input("自定义地域范围", value="全球+中国专项")
-        stance = st.selectbox("分析立场", ["PE/VC", "产业方", "二级市场", "战略咨询", "技术评估"], index=0)
+        st.caption("分析立场：默认全覆盖，不再需要手动选择。")
         depth = st.segmented_control("报告深度", ["快速版", "标准版", "深度版"], default="标准版")
         provider = st.selectbox("模型提供方", list(PROVIDER_PRESETS.keys()), index=0)
         preset = PROVIDER_PRESETS[provider]
@@ -137,11 +137,11 @@ def sidebar_request() -> tuple[ReportRequest, str, bool]:
             value=True,
             help="提高微信公众号/产业文章在检索和排序中的优先级，但仍会标注为需复核来源，不允许单独支撑强结论。",
         )
-        source_default = 14 if (depth or "标准版") == "深度版" else 10
+        source_default = 18 if (depth or "标准版") == "深度版" else 14
         max_local_sources = st.slider(
             "本地检索来源数",
             min_value=0,
-            max_value=20,
+            max_value=32,
             value=source_default,
             step=1,
             key=f"local_sources_{provider}_{depth or '标准版'}",
@@ -192,7 +192,6 @@ def sidebar_request() -> tuple[ReportRequest, str, bool]:
         provider=provider,
         industry=industry.strip(),
         region=region,
-        stance=stance,
         depth=depth or "标准版",
         focus_questions=focus_questions,
         source_urls=source_urls,

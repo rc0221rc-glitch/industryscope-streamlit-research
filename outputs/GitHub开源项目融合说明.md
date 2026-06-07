@@ -47,6 +47,11 @@
    - 是否有开源研究工作流自检
    - 是否有多视角审视
    - 是否有来源相关性审查/剔除来源说明
+8. 信息收集升级为“宽检索 + 深信号检索 + 最新动作检索”：
+   - 通用行业会强制搜索材料、工艺、设备、良率、可靠性、封装、专利、论文、拆解、招聘、供应链和客户认证。
+   - 肌电/EMG 手环自动扩展 `DLC/diamond-like carbon`、干电极、皮肤-电极界面、阻抗、Meta/CTRL-Labs、专利和 Nature/论文关键词。
+   - 玻璃基板封装自动扩展 `glass core substrate`、TGV、panel-level packaging、warpage、CTE、RDL、TSMC/Intel/Samsung/Corning 等关键词。
+   - 新增 Google News RSS 与 arXiv 轻量入口；失败时静默回退，不影响主流程。
 
 ## Scrapling 融合判断
 
