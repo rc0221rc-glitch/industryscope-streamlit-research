@@ -72,7 +72,7 @@ streamlit run app.py
 - 借鉴 GPT Researcher / open_deep_research / STORM / deep-research 的研究工作流：研究计划、多视角提纲、迭代检索、来源审计、结论审计
 - 本地检索会按相关性与来源权威性排序，并过滤电商、歌词、视频、地图、登录页等低价值来源
 - 可默认优先检索微信公众号文章，用于发现中国市场产业线索；公众号来源会被标注为需复核，不单独支撑强结论
-- 可选使用 `trafilatura` 做网页正文抽取，失败时回退 BeautifulSoup
+- 使用 `Scrapling Selector + trafilatura + BeautifulSoup` 三层正文抽取：优先识别微信公众号、新闻、研报、公告正文容器；失败时回退通用正文抽取，避免把搜索摘要、导航页或电商页当证据
 - 强制输出可点击引用
 - HTML 单文件导出
 - 引用审计表与质量检查

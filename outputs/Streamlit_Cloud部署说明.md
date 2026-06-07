@@ -7,7 +7,7 @@
 - Repo: `industryscope-streamlit-research`
 - Branch: `main`
 - Main file path: `app.py`
-- 当前可见性：Private
+- 当前可见性：Public
 
 ## 部署入口
 
@@ -49,7 +49,7 @@ OPENAI_COMPAT_MODEL = ""
 ## 注意事项
 
 1. 不要把真实 API Key 提交到 GitHub。
-2. 当前仓库是 private，Streamlit Cloud 需要授权访问该 GitHub private repo。
-3. 如果部署时依赖安装失败，可先移除 `requirements.txt` 中的可选依赖 `trafilatura`，工具会回退到 BeautifulSoup 正文抽取。
-4. 部署完成后，Streamlit 会给出类似 `https://xxx.streamlit.app` 的长期访问链接。
-
+2. 当前仓库是 public，可直接在 Streamlit Cloud 选择 GitHub 仓库部署。
+3. `scrapling` 只使用轻量 Selector 正文抽取层，不默认启用 Playwright/动态浏览器抓取。
+4. 如果部署时依赖安装失败，可先移除 `requirements.txt` 中的可选依赖 `trafilatura` 或 `scrapling`，工具会回退到 BeautifulSoup 正文抽取。
+5. 部署完成后，Streamlit 会给出类似 `https://xxx.streamlit.app` 的长期访问链接。

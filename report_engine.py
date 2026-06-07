@@ -22,6 +22,11 @@ except ImportError:  # Optional: keep the app usable before requirements are ins
     trafilatura = None
 
 try:
+    from scrapling import Selector as ScraplingSelector
+except ImportError:  # Optional parser enhancement; BeautifulSoup remains the final fallback.
+    ScraplingSelector = None
+
+try:
     import streamlit as st
 except ImportError:
     st = None
@@ -102,7 +107,7 @@ OPEN_SOURCE_RESEARCH_METHODS = """
 1. GPT Researcher / open_deep_research 式工作流：先拆解研究任务和检索计划，再写报告；不要边搜边顺手下结论。输出前必须完成“研究计划、来源审计、结论审计”三步。
 2. STORM 式多视角知识策展：至少从技术专家、产业链经营者、客户/采购方、一级市场投资人、二级市场分析师、怀疑者/空头六个视角提出问题。执行摘要必须回应这些视角中的关键分歧。
 3. deep-research 式迭代检索：不得只用一轮宽泛关键词。必须覆盖 breadth（市场/技术/竞争/政策/财务）和 depth（二阶问题/反证/原始公告/论文/年报）两类查询意图。
-4. Crawl4AI / Trafilatura 式内容清洗：只把网页正文、公告正文、论文摘要、市场报告页面当作证据；导航、登录页、电商页、视频页、歌词页、地图页、论坛闲聊、搜索结果页不得支撑结论。
+4. Scrapling / Crawl4AI / Trafilatura 式内容清洗：只把工具明确抽取到的网页正文、公告正文、论文摘要、市场报告页面当作证据；搜索结果摘要只能作为候选线索。导航、登录页、电商页、视频页、歌词页、地图页、论坛闲聊、搜索结果页不得支撑结论。来源上下文中的“正文抽取方法”如果显示为 search snippet only、no readable text extracted 或正文与行业无关，必须把该来源降级或剔除。
 5. 研究报告不是资料堆砌：每个来源都要回答“它支持了哪条判断、支持强度多高、不能支持什么”。如果来源只证明概念存在，不能外推到市场份额、收入或投资评级。
 6. 发布前自检：报告最后必须输出“开源研究工作流自检”，逐项说明多视角是否覆盖、是否做了迭代检索、是否剔除低质来源、是否完成反证检查。
 """
@@ -163,7 +168,7 @@ SECTION_TASKS = """
 用表格输出：潜在错误类型、报告中如何规避、仍需人工核验的点。至少覆盖：口径混用、层级混淆、未来事实化、弱来源强结论、技术阶段误判、投资建议越界。
 
 ## 开源研究工作流自检
-按表格输出：借鉴方法、已执行动作、证据、未完成/残余风险。至少覆盖 GPT Researcher/open_deep_research 的研究计划与来源审计、STORM 的多视角提纲、deep-research 的迭代检索、Crawl4AI/Trafilatura 的正文清洗、发布前引用检查。
+按表格输出：借鉴方法、已执行动作、证据、未完成/残余风险。至少覆盖 GPT Researcher/open_deep_research 的研究计划与来源审计、STORM 的多视角提纲、deep-research 的迭代检索、Scrapling/Crawl4AI/Trafilatura 的正文清洗、发布前引用检查。
 """
 
 
@@ -955,50 +960,179 @@ def bing_html_search(query: str) -> list[dict[str, str]]:
     return items
 
 
-def fetch_source_text(url: str, timeout: int = 15) -> str:
-    if url.lower().split("?")[0].endswith((".pdf", ".xlsx", ".xls", ".docx", ".pptx")):
-        return ""
-    response = requests.get(
-        url,
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=timeout,
+CONTENT_SELECTORS = (
+    "#js_content",
+    ".rich_media_content",
+    ".rich_media_area_primary_inner",
+    "article",
+    "main",
+    "[role='main']",
+    ".article-content",
+    ".article__content",
+    ".article-body",
+    ".article",
+    ".post-content",
+    ".entry-content",
+    ".news-content",
+    ".story-content",
+    ".report-content",
+    ".content-body",
+    ".main-content",
+    "#content",
+)
+
+
+def normalize_extracted_text(text: str, limit: int = 3200) -> str:
+    text = html.unescape(text or "").replace("\xa0", " ")
+    text = re.sub(r"在小说阅读器读本章|去阅读|在小说阅读器中沉浸阅读", "", text)
+    text = re.sub(r"[ \t\r\f\v]{2,}", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    lines: list[str] = []
+    previous = ""
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line == previous:
+            continue
+        lines.append(line)
+        previous = line
+    return "\n".join(lines).strip()[:limit]
+
+
+def extracted_text_quality(text: str) -> float:
+    if not text:
+        return 0
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 120:
+        return 0
+    paragraphs = len([line for line in text.splitlines() if len(line.strip()) >= 18])
+    digits = len(re.findall(r"\d", text))
+    chinese_chars = len(re.findall(r"[\u4e00-\u9fff]", text))
+    alpha_words = len(re.findall(r"[A-Za-z]{4,}", text))
+    source_markers = len(re.findall(r"来源|数据|公告|报告|年报|论文|市场|公司|政策|according|report|market|revenue", text, re.I))
+    navigation_noise = len(
+        re.findall(
+            r"登录|注册|购物车|加入购物车|cookie|javascript|subscribe|newsletter|sign in|menu|privacy policy|all rights reserved",
+            text,
+            re.I,
+        )
     )
-    response.raise_for_status()
-    content_type = response.headers.get("content-type", "")
-    if "text/html" not in content_type and "text/plain" not in content_type:
-        return ""
-    if trafilatura is not None:
+    return len(compact) + paragraphs * 90 + min(digits, 80) * 2 + chinese_chars * 0.15 + alpha_words + source_markers * 60 - navigation_noise * 260
+
+
+def extract_with_scrapling(html_text: str, url: str) -> tuple[str, str]:
+    if ScraplingSelector is None:
+        return "", ""
+    try:
+        page = ScraplingSelector(html_text, url=url)
+    except Exception:
+        return "", ""
+
+    best_text = ""
+    best_selector = ""
+    best_score = 0.0
+    for selector in CONTENT_SELECTORS:
+        try:
+            nodes = page.css(selector)
+        except Exception:
+            continue
+        for node in nodes[:4]:
+            try:
+                text = normalize_extracted_text(str(node.get_all_text(separator="\n", strip=True)))
+            except Exception:
+                continue
+            score = extracted_text_quality(text)
+            if score > best_score:
+                best_text = text
+                best_selector = selector
+                best_score = score
+    if best_text and best_score > 160:
+        return best_text, f"Scrapling Selector {best_selector}"
+    return "", ""
+
+
+def extract_with_trafilatura(html_text: str, url: str) -> tuple[str, str]:
+    if trafilatura is None:
+        return "", ""
+    try:
         extracted = trafilatura.extract(
-            response.text,
+            html_text,
             url=url,
             include_comments=False,
             include_tables=True,
             favor_precision=True,
             output_format="txt",
         )
-        if extracted and len(extracted.strip()) > 160:
-            extracted = re.sub(r"\n{3,}", "\n\n", extracted.strip())
-            extracted = re.sub(r"[ \t]{2,}", " ", extracted)
-            return extracted[:3200]
-    soup = BeautifulSoup(response.text, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
+    except Exception:
+        return "", ""
+    text = normalize_extracted_text(extracted or "")
+    if len(text) > 160:
+        return text, "Trafilatura precision"
+    return "", ""
+
+
+def extract_with_beautifulsoup(html_text: str) -> tuple[str, str]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript", "form", "button"]):
         tag.decompose()
-    text = soup.get_text("\n", strip=True)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    return text[:2400]
+    text = normalize_extracted_text(soup.get_text("\n", strip=True), limit=2400)
+    if len(text) > 80:
+        return text, "BeautifulSoup fallback"
+    return "", ""
+
+
+def fetch_source_text_with_method(url: str, timeout: int = 15) -> tuple[str, str]:
+    if url.lower().split("?")[0].endswith((".pdf", ".xlsx", ".xls", ".docx", ".pptx")):
+        return "", "binary document skipped"
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        },
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "")
+    if "text/html" not in content_type and "text/plain" not in content_type:
+        return "", f"unsupported content-type: {content_type or 'unknown'}"
+    if not response.encoding or response.encoding.lower() in {"iso-8859-1", "ascii"}:
+        response.encoding = response.apparent_encoding or "utf-8"
+
+    candidates: list[tuple[float, str, str]] = []
+    for text, method in (
+        extract_with_scrapling(response.text, url),
+        extract_with_trafilatura(response.text, url),
+        extract_with_beautifulsoup(response.text),
+    ):
+        if text:
+            candidates.append((extracted_text_quality(text), text, method))
+
+    if not candidates:
+        return "", "no readable text extracted"
+    _, text, method = max(candidates, key=lambda item: item[0])
+    return text, method
+
+
+def fetch_source_text(url: str, timeout: int = 15) -> str:
+    text, _ = fetch_source_text_with_method(url, timeout=timeout)
+    return text
 
 
 def build_source_context(sources: list[dict[str, str]], industry: str = "", per_source_chars: int = 1800) -> str:
     blocks: list[str] = []
     for idx, source in enumerate(sources, start=1):
         text = ""
+        extraction_method = "not fetched"
         try:
-            text = fetch_source_text(source["url"])[:per_source_chars]
+            text, extraction_method = fetch_source_text_with_method(source["url"])
+            text = text[:per_source_chars]
             if industry and text and source_relevance_score(industry, source.get("title", ""), source["url"], text) < 2:
                 text = "正文抓取结果与行业关键词不匹配，已自动剔除；请仅把该来源作为候选入口，必要时人工打开 URL 核验。"
         except Exception:
             text = source.get("snippet", "")
+            extraction_method = "fetch failed; search snippet only"
         snippet = source.get("snippet", "")
         citation = f"[S{idx} {source.get('title', source['url'])}]({source['url']})"
         block = (
@@ -1009,6 +1143,7 @@ def build_source_context(sources: list[dict[str, str]], industry: str = "", per_
             f"检索摘要: {snippet}\n"
             f"相关性评分: {source.get('relevance', '未评分')}（低于2的来源不会进入上下文）\n"
             f"权威性加分: {source_authority_score(source['url'])}\n"
+            f"正文抽取方法: {extraction_method}\n"
             f"使用约束: {'公众号可作为产业线索，强结论必须再找一手/权威来源交叉验证。' if 'mp.weixin.qq.com' in urlparse(source['url']).netloc.lower() else '按来源类型决定证据强度。'}\n"
             f"网页正文节选: {text}\n"
         )
