@@ -52,6 +52,11 @@
    - 肌电/EMG 手环自动扩展 `DLC/diamond-like carbon`、干电极、皮肤-电极界面、阻抗、Meta/CTRL-Labs、专利和 Nature/论文关键词。
    - 玻璃基板封装自动扩展 `glass core substrate`、TGV、panel-level packaging、warpage、CTE、RDL、TSMC/Intel/Samsung/Corning 等关键词。
    - 新增 Google News RSS 与 arXiv 轻量入口；失败时静默回退，不影响主流程。
+9. 来源筛选升级为“候选池 + 来源画像 + 信息浓度分层”：
+   - 多渠道候选池包括搜索引擎、Google News RSS、OpenAlex、Crossref、arXiv、GitHub、专利/学术/官方种子入口和微信公众号。
+   - 每条来源自动标注 T0/T1/T2/T3、信息源渠道、高质量信息浓度、使用限制。
+   - T0/T1 优先支撑核心结论；T2 用于新闻和产业观点；T3 仅作为线索入口，不能单独支撑强结论。
+   - 报告新增“信息源渠道分层复盘”，输出本次来源池质量结构和下次优先追踪的信息源。
 
 ## Scrapling 融合判断
 

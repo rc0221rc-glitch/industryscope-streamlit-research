@@ -61,6 +61,7 @@ SOURCE_RULES = """
 5. 严格区分：已发生事实、公司目标、第三方预测、模型推断、作者观点。未来日期事件一律不得写成事实。
 6. 不能编造 URL、公司、融资、财务、市场份额、政策、论文、客户绑定关系。来源没有明确支持时，写“证据不足”，不要补脑。
 7. 引用审计表必须列出所有关键来源的 URL、类型、支持了哪条结论、证据强度、风险。来源质量评估不得自夸；必须指出缺口和弱证据。
+8. 工具会为来源打上 T0/T1/T2/T3 与“高质量信息浓度”。T0/T1 优先进入核心结论；T2 用于新闻和产业观点；T3 只能用于发现线索。引用审计表必须保留“信息源分层/信息浓度/使用限制”三列。
 """
 
 
@@ -181,7 +182,10 @@ SECTION_TASKS = """
 输出 bull/base/bear 三情景，并给出触发条件、对应标的类型、应避免的标的类型。最后列“本报告最不确定的 5 个判断”。
 
 ## 引用审计表
-不得省略。至少 10 条来源，深度版至少 18 条。每条写 Source ID、来源标题、URL、来源类型、支持结论、发布时间/访问时间、证据强度、风险。
+不得省略。至少 10 条来源，深度版至少 18 条。每条写 Source ID、来源标题、URL、来源类型、信息源分层、信息浓度、支持结论、发布时间/访问时间、证据强度、使用限制、风险。
+
+## 信息源渠道分层复盘
+必须输出本次来源池复盘：T0/T1/T2/T3 各有多少条，哪些高浓度来源支撑了核心结论，哪些 T3 来源只作为线索，哪些重要问题仍缺少 T0/T1 来源。最后给出“下次优先追踪的信息源清单”。
 
 ## 反错误审计
 用表格输出：潜在错误类型、报告中如何规避、仍需人工核验的点。至少覆盖：口径混用、层级混淆、未来事实化、弱来源强结论、技术阶段误判、投资建议越界。
@@ -215,6 +219,7 @@ REPORT_OUTLINE = """
 ## 风险、机会与领先指标
 ## 投资/战略结论
 ## 引用审计表
+## 信息源渠道分层复盘
 ## 研究局限与待核验清单
 ## 反错误审计
 ## 开源研究工作流自检
@@ -530,7 +535,7 @@ def call_openai(req: ReportRequest, api_key: str) -> tuple[str, list[dict[str, s
 
 def search_public_web(req: ReportRequest, max_results: int = 12) -> list[dict[str, str]]:
     """Collect public source candidates for providers without hosted web search."""
-    deadline = time.monotonic() + {"快速版": 18, "标准版": 28, "深度版": 42}.get(req.depth, 28)
+    deadline = time.monotonic() + {"快速版": 24, "标准版": 45, "深度版": 75}.get(req.depth, 45)
     aliases = industry_search_aliases(req.industry)
     queries = build_research_queries(req, aliases)
     results: list[dict[str, str]] = []
@@ -564,14 +569,15 @@ def search_public_web(req: ReportRequest, max_results: int = 12) -> list[dict[st
             return False
         return True
 
-    def add(title: str, url: str, snippet: str = "") -> None:
+    def add(title: str, url: str, snippet: str = "", retrieval_channel: str = "", query: str = "") -> None:
         clean_url = unwrap_search_url(url)
         if not clean_url.startswith(("http://", "https://")):
             return
         if clean_url in seen or not domain_ok(clean_url):
             return
         score = source_relevance_score(req.industry, title, clean_url, snippet)
-        if score < 2:
+        profile = source_profile(req.industry, title, clean_url, snippet, relevance=score)
+        if score < 2 and profile["source_tier"] not in {"T0", "T1"}:
             return
         seen.add(clean_url)
         results.append({
@@ -579,46 +585,72 @@ def search_public_web(req: ReportRequest, max_results: int = 12) -> list[dict[st
             "url": clean_url,
             "snippet": snippet.strip()[:500],
             "relevance": str(score),
+            "retrieval_channel": retrieval_channel,
+            "query": query[:220],
+            **profile,
         })
 
     for item in curated_source_candidates(req.industry):
-        add(item["title"], item["url"], item.get("snippet", ""))
+        add(item["title"], item["url"], item.get("snippet", ""), retrieval_channel="curated_seed", query="industry_seed")
 
-    query_limit = {"快速版": 8, "标准版": 16, "深度版": 26}.get(req.depth, 16)
+    query_limit = {"快速版": 10, "标准版": 22, "深度版": 36}.get(req.depth, 22)
     for query in queries[:query_limit]:
         if time.monotonic() > deadline:
             break
         try:
             for item in google_news_rss_search(query):
-                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""))
+                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""), retrieval_channel="google_news_rss", query=query)
         except Exception:
             pass
         if time.monotonic() > deadline:
             break
+        if query_needs_academic_search(query):
+            try:
+                for item in openalex_search(query):
+                    add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""), retrieval_channel="openalex", query=query)
+            except Exception:
+                pass
+            if time.monotonic() > deadline:
+                break
+            try:
+                for item in crossref_search(query):
+                    add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""), retrieval_channel="crossref", query=query)
+            except Exception:
+                pass
+            if time.monotonic() > deadline:
+                break
         try:
             for item in arxiv_search(query):
-                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""))
+                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""), retrieval_channel="arxiv", query=query)
         except Exception:
             pass
         if time.monotonic() > deadline:
             break
+        if query_needs_open_source_search(query):
+            try:
+                for item in github_repo_search(query):
+                    add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""), retrieval_channel="github", query=query)
+            except Exception:
+                pass
+            if time.monotonic() > deadline:
+                break
         try:
             for item in jina_search(query):
-                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""))
+                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""), retrieval_channel="jina_search", query=query)
         except Exception:
             pass
         if time.monotonic() > deadline:
             break
         try:
             for item in duckduckgo_html_search(query):
-                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""))
+                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""), retrieval_channel="duckduckgo_html", query=query)
         except Exception:
             pass
         if time.monotonic() > deadline:
             break
         try:
             for item in bing_html_search(query):
-                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""))
+                add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""), retrieval_channel="bing_html", query=query)
         except Exception:
             continue
     return rank_sources(results, prefer_wechat=req.prefer_wechat, max_results=max_results)
@@ -768,7 +800,8 @@ def is_low_value_domain(host: str) -> bool:
         "twitter.com", "reddit.com", "quora.com", "genius.com", "lyrics.com",
         "yelp.com", "yellowpages.com", "cars.com", "claycooley.com", "off---white.com",
         "off-white.com", "xfinity.com", "comcast.com",
-        "baike.baidu.com", "wikipedia.org", "wikiwand.com",
+        "baike.baidu.com", "wikipedia.org", "wikiwand.com", "lowes.com", "homedepot.com",
+        "amazon.com", "walmart.com", "target.com", "wayfair.com", "aliexpress.com", "ebay.com",
     ]
     return any(host == domain or host.endswith("." + domain) for domain in low_value_domains)
 
@@ -819,7 +852,8 @@ def source_relevance_score(industry: str, title: str, url: str, snippet: str = "
     unrelated_terms = [
         "off-white", "sneaker", "shoes", "fashion", "sunglasses", "lyrics", "rihanna",
         "disturbia", "maps", "login", "password", "kia", "dealer", "restaurant",
-        "hotel", "travel", "youtube", "gmail", "xfinity", "comcast",
+        "hotel", "travel", "youtube", "gmail", "xfinity", "comcast", "patio", "furniture",
+        "chair", "chairs", "outdoor seating", "shopping", "cart", "coupon",
     ]
     if any(term in text for term in unrelated_terms):
         score -= 8
@@ -828,9 +862,85 @@ def source_relevance_score(industry: str, title: str, url: str, snippet: str = "
     return score
 
 
+def source_profile(industry: str, title: str, url: str, snippet: str = "", relevance: int | None = None) -> dict[str, Any]:
+    host = urlparse(url).netloc.lower().removeprefix("www.")
+    path = urlparse(url).path.lower()
+    text = f"{title} {url} {snippet}".lower()
+    relevance_score = source_relevance_score(industry, title, url, snippet) if relevance is None else relevance
+    authority = source_authority_score(url)
+
+    tier = "T3"
+    channel = "普通网页/候选线索"
+    use_policy = "只能作为线索或背景，强结论必须交叉验证。"
+    parsed = urlparse(url)
+    query_keys = set(parse_qs(parsed.query).keys())
+    is_search_entry = (
+        any(token in host for token in ["scholar.google.com", "news.google.com"])
+        or bool(re.search(r"(^|/)(search|searchnews)(\.html|/|$)", path))
+        or bool(query_keys & {"q", "query", "keywords", "term", "s", "searchtext"})
+    )
+    if is_search_entry:
+        tier = "T3"
+        channel = "搜索入口/线索集合"
+        use_policy = "只能作为继续检索入口，不能直接作为事实证据。"
+    elif host.endswith((".gov", ".edu")) or ".gov." in host or any(token in host for token in ["sec.gov", "sse.com.cn", "szse.cn", "hkexnews.hk", "cninfo.com.cn", "patents.google.com", "uspto.gov", "wipo.int"]):
+        tier = "T0"
+        channel = "一手/监管/专利/政府"
+        use_policy = "可支撑事实、政策、披露、专利和时间线；市场结论仍需口径说明。"
+    elif any(token in host for token in ["ieee.org", "nature.com", "science.org", "springer.com", "spiedigitallibrary.org", "arxiv.org", "openalex.org", "doi.org", "crossref.org", "ncbi.nlm.nih.gov"]):
+        tier = "T0"
+        channel = "论文/学术"
+        use_policy = "可支撑技术原理、实验阶段和瓶颈；不得直接外推市场份额或商业收入。"
+    elif any(token in host for token in ["investor", "annualreports.com"]) or any(token in path for token in ["annual", "10-k", "10q", "investor", "presentation", "earnings"]):
+        tier = "T0"
+        channel = "公司披露/财报/投资者材料"
+        use_policy = "可支撑公司事实、财务、产能、客户披露和管理层表述。"
+    elif any(token in host for token in ["tsmc.com", "intel.com", "samsung.com", "corning.com", "about.meta.com", "meta.com", "tech.facebook.com", "ai.meta.com", "broadcom.com", "marvell.com", "coherent.com", "lumentum.com", "imec-int.com"]):
+        tier = "T1"
+        channel = "公司官方/技术博客"
+        use_policy = "可支撑公司动作、产品路线和技术声明；竞争评价需第三方交叉验证。"
+    elif any(token in host for token in ["yolegroup.com", "lightcounting.com", "omdia.com", "idc.com", "gartner.com", "semi.org", "semiconductors.org", "trendforce.com", "counterpointresearch.com", "canalys.com"]):
+        tier = "T1"
+        channel = "权威数据机构/行业协会"
+        use_policy = "可支撑市场规模、份额和行业趋势，但必须写清口径和发布时间。"
+    elif any(token in host for token in ["reuters.com", "bloomberg.com", "wsj.com", "ft.com", "nikkei.com", "caixin.com", "semiengineering.com", "eetimes.com", "digitimes.com"]):
+        tier = "T2"
+        channel = "主流财经/专业技术媒体"
+        use_policy = "可支撑新闻事件和产业观点；重大数字需一手来源或数据机构交叉验证。"
+    elif "mp.weixin.qq.com" in host:
+        tier = "T3"
+        channel = "微信公众号/产业线索"
+        use_policy = "适合发现中国市场线索、专家访谈和争议点；不得单独支撑强结论。"
+    depth_hits = len(re.findall(r"材料|工艺|专利|论文|良率|可靠性|阻抗|电极|界面|封装|客户认证|供应商|拆解|patent|paper|yield|reliability|electrode|interface|substrate|packaging|supplier|teardown|certification", text, re.I))
+    recency_hits = len(re.findall(r"2026|2025|最新|recent|latest|announces|launches|published|pubdate", text, re.I))
+    primary_bonus = {"T0": 18, "T1": 12, "T2": 6, "T3": 1}.get(tier, 0)
+    evidence_density = relevance_score * 2 + authority * 3 + primary_bonus + min(depth_hits, 8) * 3 + min(recency_hits, 4) * 2
+    if is_search_entry:
+        evidence_density -= 8
+    if is_low_value_domain(host):
+        evidence_density -= 20
+
+    if evidence_density >= 42:
+        density_band = "高"
+    elif evidence_density >= 26:
+        density_band = "中"
+    else:
+        density_band = "低"
+
+    return {
+        "source_tier": tier,
+        "source_channel": channel,
+        "evidence_density": str(max(0, int(evidence_density))),
+        "density_band": density_band,
+        "use_policy": use_policy,
+    }
+
+
 def rank_sources(sources: list[dict[str, str]], prefer_wechat: bool = False, max_results: int | None = None) -> list[dict[str, str]]:
     def score(item: dict[str, str]) -> int:
-        return int(item.get("relevance", "0")) + source_authority_score(item.get("url", ""))
+        density = int(item.get("evidence_density", "0") or 0)
+        tier_bonus = {"T0": 80, "T1": 55, "T2": 30, "T3": 10}.get(item.get("source_tier", "T3"), 0)
+        return density + tier_bonus + int(item.get("relevance", "0") or 0)
 
     ranked = sorted(sources, key=score, reverse=True)
     if not prefer_wechat or not max_results:
@@ -841,16 +951,29 @@ def rank_sources(sources: list[dict[str, str]], prefer_wechat: bool = False, max
     if not wechat:
         return ranked[:max_results]
 
-    wechat_slots = min(len(wechat), max(1, max_results // 4))
-    selected = wechat[:wechat_slots]
-    for item in non_wechat:
+    selected: list[dict[str, str]] = []
+    t0_t1 = [item for item in non_wechat if item.get("source_tier") in {"T0", "T1"}]
+    rest_non_wechat = [item for item in non_wechat if item not in t0_t1]
+    for item in t0_t1:
         if len(selected) >= max_results:
             break
         selected.append(item)
+    wechat_slots = min(len(wechat), max(1, max_results // 5))
+    for item in wechat[:wechat_slots]:
+        if len(selected) >= max_results:
+            break
+        if item not in selected:
+            selected.append(item)
+    for item in rest_non_wechat:
+        if len(selected) >= max_results:
+            break
+        if item not in selected:
+            selected.append(item)
     for item in wechat[wechat_slots:]:
         if len(selected) >= max_results:
             break
-        selected.append(item)
+        if item not in selected:
+            selected.append(item)
     return selected[:max_results]
 
 
@@ -1109,6 +1232,97 @@ def google_news_rss_search(query: str) -> list[dict[str, str]]:
             "title": title,
             "url": link,
             "snippet": f"Google News RSS; source={source}; pubDate={pub_date}",
+        })
+    return items
+
+
+def query_needs_academic_search(query: str) -> bool:
+    return bool(re.search(r"论文|专利|材料|工艺|良率|可靠性|review|paper|patent|material|process|yield|reliability|electrode|substrate|IEEE|Nature|SPIE|OFC", query, re.I))
+
+
+def query_needs_open_source_search(query: str) -> bool:
+    return bool(re.search(r"算法|软件|SDK|开源|仿真|数据集|模型|github|open source|software|algorithm|dataset|simulation|EDA", query, re.I))
+
+
+def openalex_search(query: str) -> list[dict[str, str]]:
+    response = requests.get(
+        "https://api.openalex.org/works",
+        params={"search": query, "per-page": 6, "sort": "cited_by_count:desc"},
+        headers={"User-Agent": "IndustryScope/1.0 (mailto:research@example.com)"},
+        timeout=8,
+    )
+    response.raise_for_status()
+    items: list[dict[str, str]] = []
+    for work in response.json().get("results", [])[:6]:
+        title = work.get("display_name") or ""
+        url = work.get("doi") or work.get("id") or ""
+        if isinstance(url, str) and url.startswith("https://doi.org/"):
+            clean_url = url
+        elif isinstance(url, str) and url.startswith("10."):
+            clean_url = f"https://doi.org/{url}"
+        else:
+            clean_url = work.get("primary_location", {}).get("landing_page_url") or work.get("id") or ""
+        year = work.get("publication_year", "")
+        cited = work.get("cited_by_count", 0)
+        concepts = ", ".join((concept.get("display_name", "") for concept in work.get("concepts", [])[:4] if concept.get("display_name")))
+        abstract = openalex_abstract(work.get("abstract_inverted_index") or {})
+        items.append({
+            "title": title,
+            "url": clean_url,
+            "snippet": f"OpenAlex; year={year}; cited_by={cited}; concepts={concepts}; {abstract[:260]}",
+        })
+    return items
+
+
+def openalex_abstract(inverted_index: dict[str, list[int]]) -> str:
+    if not inverted_index:
+        return ""
+    pairs: list[tuple[int, str]] = []
+    for word, positions in inverted_index.items():
+        for pos in positions:
+            pairs.append((pos, word))
+    return " ".join(word for _, word in sorted(pairs)[:120])
+
+
+def crossref_search(query: str) -> list[dict[str, str]]:
+    response = requests.get(
+        "https://api.crossref.org/works",
+        params={"query": query, "rows": 6, "sort": "is-referenced-by-count", "order": "desc"},
+        headers={"User-Agent": "IndustryScope/1.0 (mailto:research@example.com)"},
+        timeout=8,
+    )
+    response.raise_for_status()
+    items: list[dict[str, str]] = []
+    for work in response.json().get("message", {}).get("items", [])[:6]:
+        title = " ".join(work.get("title", [])[:1])
+        doi = work.get("DOI", "")
+        url = work.get("URL") or (f"https://doi.org/{doi}" if doi else "")
+        year_parts = work.get("published-print", {}).get("date-parts") or work.get("published-online", {}).get("date-parts") or [[]]
+        year = year_parts[0][0] if year_parts and year_parts[0] else ""
+        publisher = work.get("publisher", "")
+        cited = work.get("is-referenced-by-count", 0)
+        items.append({
+            "title": title,
+            "url": url,
+            "snippet": f"Crossref; year={year}; publisher={publisher}; cited_by={cited}; DOI={doi}",
+        })
+    return items
+
+
+def github_repo_search(query: str) -> list[dict[str, str]]:
+    response = requests.get(
+        "https://api.github.com/search/repositories",
+        params={"q": query, "sort": "stars", "order": "desc", "per_page": 5},
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "IndustryScope/1.0"},
+        timeout=8,
+    )
+    response.raise_for_status()
+    items: list[dict[str, str]] = []
+    for repo in response.json().get("items", [])[:5]:
+        items.append({
+            "title": repo.get("full_name", ""),
+            "url": repo.get("html_url", ""),
+            "snippet": f"GitHub; stars={repo.get('stargazers_count', 0)}; language={repo.get('language')}; updated={repo.get('updated_at')}; {repo.get('description') or ''}",
         })
     return items
 
@@ -1389,6 +1603,7 @@ def fetch_source_text(url: str, timeout: int = 15) -> str:
 
 def build_source_context(sources: list[dict[str, str]], industry: str = "", per_source_chars: int = 2400) -> str:
     blocks: list[str] = []
+    tier_summary = source_tier_summary(sources)
     for idx, source in enumerate(sources, start=1):
         text = ""
         extraction_method = "not fetched"
@@ -1406,16 +1621,39 @@ def build_source_context(sources: list[dict[str, str]], industry: str = "", per_
             f"[S{idx}] {source.get('title', source['url'])}\n"
             f"URL: {source['url']}\n"
             f"来源类型: {classify_source_type(source['url'])}\n"
+            f"信息源分层: {source.get('source_tier', 'T3')} / {source.get('source_channel', '普通网页/候选线索')}\n"
+            f"高质量信息浓度: {source.get('density_band', '未评分')}（分数 {source.get('evidence_density', '0')}）\n"
             f"必须使用的Markdown引用片段: {citation}\n"
             f"检索摘要: {snippet}\n"
             f"相关性评分: {source.get('relevance', '未评分')}（低于2的来源不会进入上下文）\n"
             f"权威性加分: {source_authority_score(source['url'])}\n"
             f"正文抽取方法: {extraction_method}\n"
-            f"使用约束: {'公众号可作为产业线索，强结论必须再找一手/权威来源交叉验证。' if 'mp.weixin.qq.com' in urlparse(source['url']).netloc.lower() else '按来源类型决定证据强度。'}\n"
+            f"使用约束: {source.get('use_policy') or ('公众号可作为产业线索，强结论必须再找一手/权威来源交叉验证。' if 'mp.weixin.qq.com' in urlparse(source['url']).netloc.lower() else '按来源类型决定证据强度。')}\n"
             f"网页正文节选: {text}\n"
         )
         blocks.append(block)
-    return "\n---\n".join(blocks)
+    return tier_summary + "\n---\n" + "\n---\n".join(blocks)
+
+
+def source_tier_summary(sources: list[dict[str, str]]) -> str:
+    if not sources:
+        return "来源分层摘要：无自动检索来源。"
+    counts: dict[str, int] = {}
+    channels: dict[str, int] = {}
+    for source in sources:
+        tier = source.get("source_tier", "T3")
+        channel = source.get("source_channel", "普通网页/候选线索")
+        counts[tier] = counts.get(tier, 0) + 1
+        channels[channel] = channels.get(channel, 0) + 1
+    count_text = "，".join(f"{tier}: {counts.get(tier, 0)}" for tier in ["T0", "T1", "T2", "T3"])
+    channel_text = "；".join(f"{name}: {count}" for name, count in sorted(channels.items(), key=lambda item: item[1], reverse=True)[:8])
+    return (
+        "来源分层摘要：\n"
+        f"- 分层数量：{count_text}\n"
+        f"- 主要渠道：{channel_text}\n"
+        "- 使用原则：T0/T1 优先支撑核心事实、数字、技术和公司动作；T2 用于新闻和产业观点；T3 只用于发现线索，强结论必须由 T0/T1/T2 交叉验证。\n"
+        "- 若 T0/T1 来源与 T3 来源冲突，必须优先采用 T0/T1，并解释冲突口径。"
+    )
 
 
 def call_chat_compatible(req: ReportRequest, api_key: str) -> tuple[str, list[dict[str, str]], dict[str, Any]]:
@@ -1700,6 +1938,7 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
     has_multi_perspective = any(term in markdown_text for term in ["PE/VC", "产业方", "二级市场", "战略咨询", "技术评估", "客户", "采购方", "怀疑者", "空头"])
     has_deep_signals = any(term in markdown_text for term in ["深信号", "隐藏拐点", "关键材料", "关键工艺", "待核验假设"])
     has_recency_section = any(term in markdown_text for term in ["最新动作", "信息时效", "最近 180 天", "最近180天", "最近 90 天", "最近90天", "最近 30 天", "最近30天"])
+    has_source_tiering = any(term in markdown_text for term in ["信息源渠道分层", "信息源分层", "信息浓度", "T0", "T1", "T2", "T3"])
     has_rejected_sources = any(term in markdown_text for term in ["剔除来源", "低相关来源", "来源相关性审查"])
     strong_patterns = ["全球\\s*第一", "独家", "垄断", "唯一", "确定性\\s*极高", "必然", "毁灭性", "订单\\s*排至", "市占率\\s*第一"]
     strong_term_hits = []
@@ -1739,6 +1978,8 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
         warnings.append("未检测到深信号/隐藏拐点小节，可能漏掉材料、工艺、专利、客户认证等关键变量。")
     if not has_recency_section:
         warnings.append("未检测到最新动作/信息时效小节，可能漏掉最近 30/90/180 天更新。")
+    if not has_source_tiering:
+        warnings.append("未检测到信息源渠道分层复盘，建议说明 T0/T1/T2/T3 来源如何支撑结论。")
     if sources and not has_rejected_sources:
         warnings.append("未检测到来源相关性审查或剔除来源说明。")
     if len(evidence_hygiene_hits) < 3:
@@ -1757,6 +1998,7 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
         "has_multi_perspective": has_multi_perspective,
         "has_deep_signals": has_deep_signals,
         "has_recency_section": has_recency_section,
+        "has_source_tiering": has_source_tiering,
         "has_rejected_sources": has_rejected_sources,
         "strong_term_hits": strong_term_hits,
         "weak_source_hits": weak_source_hits,

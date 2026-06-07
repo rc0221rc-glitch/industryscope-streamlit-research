@@ -139,13 +139,13 @@ def sidebar_request() -> tuple[ReportRequest, str, bool]:
         )
         source_default = 18 if (depth or "标准版") == "深度版" else 14
         max_local_sources = st.slider(
-            "本地检索来源数",
+            "高价值来源数",
             min_value=0,
             max_value=32,
             value=source_default,
             step=1,
             key=f"local_sources_{provider}_{depth or '标准版'}",
-            help="仅 DeepSeek / Anthropic / OpenAI兼容模式使用。工具会自动过滤低相关来源；设为 0 可跳过自动搜索，只使用用户指定来源。",
+            help="仅 DeepSeek / Anthropic / OpenAI兼容模式使用。工具会先扩展多渠道候选池，再按 T0/T1/T2/T3 和信息浓度筛选这些高价值来源；设为 0 可跳过自动搜索。",
         )
 
         st.divider()
