@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +10,7 @@ from report_engine import (
     ReportRequest,
     build_prompt,
     call_model,
+    config_value,
     ensure_clickable_source_section,
     filename_safe,
     build_source_pdf_package,
@@ -62,26 +62,26 @@ st.markdown(
 
 PROVIDER_PRESETS = {
     "OpenAI Responses": {
-        "model": st.secrets.get("OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-5.1")),
+        "model": config_value("OPENAI_MODEL", "gpt-5.1"),
         "base_url": "",
         "env": "OPENAI_API_KEY",
         "web": "OpenAI hosted web_search",
     },
     "DeepSeek": {
-        "model": st.secrets.get("DEEPSEEK_MODEL", os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")),
-        "base_url": st.secrets.get("DEEPSEEK_BASE_URL", os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")),
+        "model": config_value("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+        "base_url": config_value("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         "env": "DEEPSEEK_API_KEY",
         "web": "本地网页检索 + 来源上下文",
     },
     "OpenAI兼容": {
-        "model": st.secrets.get("OPENAI_COMPAT_MODEL", os.getenv("OPENAI_COMPAT_MODEL", "gpt-oss-120b")),
-        "base_url": st.secrets.get("OPENAI_COMPAT_BASE_URL", os.getenv("OPENAI_COMPAT_BASE_URL", "")),
+        "model": config_value("OPENAI_COMPAT_MODEL", "gpt-oss-120b"),
+        "base_url": config_value("OPENAI_COMPAT_BASE_URL", ""),
         "env": "OPENAI_COMPAT_API_KEY",
         "web": "本地网页检索 + 来源上下文",
     },
     "Anthropic": {
-        "model": st.secrets.get("QWEAPI_MODEL", os.getenv("QWEAPI_MODEL", "claude-opus-4-8")),
-        "base_url": st.secrets.get("QWEAPI_BASE_URL", os.getenv("QWEAPI_BASE_URL", "https://qweapi.com")),
+        "model": config_value("QWEAPI_MODEL", "claude-opus-4-8"),
+        "base_url": config_value("QWEAPI_BASE_URL", "https://qweapi.com"),
         "env": "QWEAPI_AUTH_TOKEN / ANTHROPIC_AUTH_TOKEN",
         "web": "本地网页检索 + qweapi Claude/GPT 自动路由",
     },
@@ -101,12 +101,12 @@ MODEL_CHOICES = {
 def default_model_for(provider: str, depth: str) -> str:
     if provider == "DeepSeek":
         if depth == "深度版":
-            return st.secrets.get("DEEPSEEK_PRO_MODEL", os.getenv("DEEPSEEK_PRO_MODEL", "deepseek-v4-pro"))
-        return st.secrets.get("DEEPSEEK_FLASH_MODEL", os.getenv("DEEPSEEK_FLASH_MODEL", os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")))
+            return config_value("DEEPSEEK_PRO_MODEL", "deepseek-v4-pro")
+        return config_value("DEEPSEEK_FLASH_MODEL", config_value("DEEPSEEK_MODEL", "deepseek-v4-flash"))
     if provider in {"Anthropic", "qweapi"}:
         if depth == "深度版":
-            return st.secrets.get("QWEAPI_OPUS_MODEL", st.secrets.get("QWEAPI_MODEL_DEEP", os.getenv("QWEAPI_OPUS_MODEL", os.getenv("QWEAPI_MODEL_DEEP", "claude-opus-4-8[1M]"))))
-        return st.secrets.get("QWEAPI_HAIKU_MODEL", os.getenv("QWEAPI_HAIKU_MODEL", st.secrets.get("QWEAPI_MODEL", os.getenv("QWEAPI_MODEL", "claude-opus-4-8"))))
+            return config_value("QWEAPI_OPUS_MODEL", config_value("QWEAPI_MODEL_DEEP", "claude-opus-4-8[1M]"))
+        return config_value("QWEAPI_HAIKU_MODEL", config_value("QWEAPI_MODEL", "claude-opus-4-8"))
     return PROVIDER_PRESETS[provider]["model"]
 
 
@@ -292,6 +292,11 @@ def generate(req: ReportRequest, manual_key: str, demo_mode: bool) -> None:
         st.session_state["source_package"] = source_package
         st.session_state["raw_response"] = raw
         st.session_state["last_request"] = req
+        if raw.get("_fallback_from"):
+            st.warning(
+                f"qweapi 原模型 {raw.get('_fallback_from')} 暂不可用，"
+                f"已自动改用 {raw.get('_request_model_used', '备用模型')} 完成生成。"
+            )
         progress.progress(100, text="生成完成")
     except APITimeoutError:
         progress.empty()
@@ -300,7 +305,7 @@ def generate(req: ReportRequest, manual_key: str, demo_mode: bool) -> None:
         progress.empty()
         message = str(exc)
         if "503" in message or "Service Unavailable" in message:
-            st.error("生成失败：Anthropic/qweapi 服务暂时不可用（503）。工具已自动重试并尝试从 [1M] 模型降级到普通模型；仍失败时建议稍后重试，或把模型手动改为 claude-opus-4-8。")
+            st.error("生成失败：qweapi 上游服务暂时不可用（503）。工具已自动重试 Claude [1M]、普通 Opus 和 GPT 5.5 路径；仍失败时通常是中转站或该 Key 的模型通道暂时不可用，建议稍后重试或临时切换 DeepSeek/OpenAI兼容。")
         else:
             st.error(f"生成失败：{exc}")
 
@@ -500,7 +505,7 @@ def main() -> None:
     req, manual_key, demo_mode = sidebar_request()
 
     st.title("IndustryScope 行业深研生成器")
-    caption_suffix = st.secrets.get("CAPTION_SUFFIX", os.getenv("CAPTION_SUFFIX", ""))
+    caption_suffix = config_value("CAPTION_SUFFIX", "")
     st.caption(f"输入行业，生成带可点击引用、引用审计、HTML 下载和来源 PDF 证据包的深度研究报告。{caption_suffix}")
 
     tab_generate, tab_kb = st.tabs(["生成研报", "知识库"])

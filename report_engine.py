@@ -2152,6 +2152,21 @@ def anthropic_model_fallbacks(model: str) -> list[str]:
     return list(dict.fromkeys(models))
 
 
+def qweapi_openai_model_fallbacks(model: str) -> list[str]:
+    models = [model]
+    if model != "gpt-5.5":
+        models.append("gpt-5.5")
+    return list(dict.fromkeys(models))
+
+
+def is_retryable_upstream_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code in {429, 500, 502, 503, 504}:
+        return True
+    text = str(exc).lower()
+    return any(token in text for token in ["429", "500", "502", "503", "504", "service unavailable", "temporarily unavailable", "timeout"])
+
+
 def post_anthropic_message(
     url: str,
     headers: dict[str, str],
@@ -2205,8 +2220,15 @@ def is_openai_routed_qweapi_model(model: str) -> bool:
     return lowered.startswith(("gpt-", "o", "deepseek-", "gemini-", "grok-"))
 
 
-def call_qweapi_openai(req: ReportRequest, api_key: str) -> tuple[str, list[dict[str, str]], dict[str, Any]]:
-    prompt, sources = build_chat_source_prompt(req)
+def call_qweapi_openai(
+    req: ReportRequest,
+    api_key: str,
+    prompt: str | None = None,
+    sources: list[dict[str, str]] | None = None,
+    fallback_from: str = "",
+) -> tuple[str, list[dict[str, str]], dict[str, Any]]:
+    if prompt is None or sources is None:
+        prompt, sources = build_chat_source_prompt(req)
     client = OpenAI(
         api_key=api_key,
         base_url=(req.base_url or "https://qweapi.com").rstrip("/") + "/v1",
@@ -2217,22 +2239,41 @@ def call_qweapi_openai(req: ReportRequest, api_key: str) -> tuple[str, list[dict
         {"role": "system", "content": "你是严谨的行业研究员。只输出可交付 Markdown 研报，不要输出闲聊或代码块。"},
         {"role": "user", "content": prompt},
     ]
-    params: dict[str, Any] = {
-        "model": req.model,
-        "messages": messages,
-        "stream": False,
-        "max_tokens": {"快速版": 6000, "标准版": 12000, "深度版": 20000}.get(req.depth, 12000),
-    }
-    try:
-        response = client.chat.completions.create(**params)
-    except Exception as exc:
-        if "max_tokens" not in str(exc).lower():
-            raise
-        params.pop("max_tokens", None)
-        response = client.chat.completions.create(**params)
-    text = response.choices[0].message.content or ""
-    data = response.model_dump() if hasattr(response, "model_dump") else json.loads(response.model_dump_json())
-    return text, sources, data
+    last_error: Exception | None = None
+    for model in qweapi_openai_model_fallbacks(req.model):
+        params: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": {"快速版": 6000, "标准版": 12000, "深度版": 20000}.get(req.depth, 12000),
+        }
+        try:
+            response = client.chat.completions.create(**params)
+        except Exception as exc:
+            if "max_tokens" in str(exc).lower():
+                params.pop("max_tokens", None)
+                try:
+                    response = client.chat.completions.create(**params)
+                except Exception as retry_exc:
+                    last_error = retry_exc
+                    if not is_retryable_upstream_error(retry_exc):
+                        raise
+                    continue
+            else:
+                last_error = exc
+                if not is_retryable_upstream_error(exc):
+                    raise
+                continue
+        text = response.choices[0].message.content or ""
+        data = response.model_dump() if hasattr(response, "model_dump") else json.loads(response.model_dump_json())
+        data["_request_model_used"] = model
+        data["_request_route"] = "qweapi_openai_compatible"
+        if fallback_from or model != req.model:
+            data["_fallback_from"] = fallback_from or req.model
+        return text, sources, data
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("qweapi OpenAI-compatible request failed before receiving a response.")
 
 
 def call_anthropic_compatible(req: ReportRequest, api_key: str) -> tuple[str, list[dict[str, str]], dict[str, Any]]:
@@ -2256,10 +2297,26 @@ def call_anthropic_compatible(req: ReportRequest, api_key: str) -> tuple[str, li
         "anthropic-version": "2023-06-01",
         "anthropic-dangerous-direct-browser-access": "true",
     }
-    response = post_anthropic_message(url, headers, payload, req.timeout_seconds)
-    response.raise_for_status()
+    try:
+        response = post_anthropic_message(url, headers, payload, req.timeout_seconds)
+        response.raise_for_status()
+    except Exception as exc:
+        if not is_retryable_upstream_error(exc):
+            raise
+        original_model = req.model
+        fallback_req = ReportRequest(**{**asdict(req), "model": "gpt-5.5"})
+        return call_qweapi_openai(
+            fallback_req,
+            api_key,
+            prompt=prompt,
+            sources=sources,
+            fallback_from=original_model,
+        )
     data = response.json()
     data["_request_model_used"] = payload.get("model")
+    data["_request_route"] = "anthropic_messages"
+    if data["_request_model_used"] != req.model:
+        data["_fallback_from"] = req.model
     text = extract_anthropic_text(data)
     return text, sources, data
 
