@@ -127,6 +127,16 @@ RECENCY_AND_DEEP_SIGNAL_RULES = """
 """
 
 
+HIGH_VALUE_WECHAT_RULES = """
+微信公众号内部质量分层（必须执行）：
+1. 不要把微信公众号整体当成高质量来源。公众号只能作为产业线索层，必须进一步区分信息浓度。
+2. 高价值公众号线索包括：调研纪要、专家访谈、电话会纪要、产业链纪要、公司交流纪要、投资者交流、券商/投行/咨询机构研报摘译、海外研究机构翻译或转述、头部机构观点整理。
+3. 重点识别的机构/关键词包括但不限于：Goldman Sachs、高盛、Morgan Stanley、摩根士丹利、J.P. Morgan、摩根大通、Bernstein、伯恩斯坦、SemiAnalysis、Semianalysis、Yole、Omdia、IDC、Gartner、TrendForce、Counterpoint、TechInsights、LightCounting、BofA、UBS、Citi、Jefferies、Barclays、Berenberg。
+4. 普通公众号观点、营销号、课程号、标题党、荐股号、未经说明的二手转载只能作为低价值线索；不得支撑强结论。
+5. 如果公众号文章声称转述海外投行/研究机构，必须在引用审计中标注“二手转述/翻译”，并尽量继续追踪原始英文报告、官网新闻稿、公司公告或权威媒体交叉验证。
+"""
+
+
 SECTION_TASKS = """
 分章任务卡（每章都要按任务执行）：
 
@@ -438,7 +448,7 @@ def build_prompt(req: ReportRequest) -> str:
     blocked = req.blocked_domains.strip() or "无。"
     allowed = req.allowed_domains.strip() or "无。"
     web_note = "请主动使用 web_search 检索公开资料。" if req.live_web else "当前为无实时搜索模式；若资料不足，必须明确说明证据不足，不要编造来源。"
-    wechat_note = "优先搜索并纳入 site:mp.weixin.qq.com 的微信公众号/产业文章作为中国市场线索，但必须标注为 B/C 或 C 级来源；不得让公众号单独支撑市场份额、融资估值、客户订单、财务、全球第一等强结论。" if req.prefer_wechat else "不特别优先微信公众号文章。"
+    wechat_note = "优先搜索并纳入 site:mp.weixin.qq.com 的微信公众号/产业文章作为中国市场线索，但必须在公众号内部继续区分：调研纪要/专家访谈/电话会/产业链纪要/海外投行或 SemiAnalysis、Bernstein 等机构研报翻译摘译 > 普通观点号 > 营销荐股号。公众号不得单独支撑市场份额、融资估值、客户订单、财务、全球第一等强结论；声称转述海外机构时必须继续追踪原始英文报告或 T0/T1/T2 来源。" if req.prefer_wechat else "不特别优先微信公众号文章。"
     return f"""你是一名严谨的产业研究负责人，正在为投资/战略决策生成可交付研报。
 
 当前日期：{today}
@@ -464,6 +474,8 @@ def build_prompt(req: ReportRequest) -> str:
 {OPEN_SOURCE_RESEARCH_METHODS}
 
 {RECENCY_AND_DEEP_SIGNAL_RULES}
+
+{HIGH_VALUE_WECHAT_RULES}
 
 {SECTION_TASKS}
 
@@ -706,6 +718,12 @@ def build_research_queries(req: ReportRequest, aliases: list[str]) -> list[str]:
             f"site:mp.weixin.qq.com {req.industry} 深度 产业链 市场规模",
             f"site:mp.weixin.qq.com {req.industry} 技术路线 竞争格局 投融资",
             f"site:mp.weixin.qq.com {req.industry} 产业纪要 专家访谈 客户验证",
+            f"site:mp.weixin.qq.com {req.industry} 调研纪要 专家纪要 电话会 交流纪要",
+            f"site:mp.weixin.qq.com {req.industry} 产业链调研 机构调研 投资者交流",
+            f"site:mp.weixin.qq.com {req.industry} 海外研报 翻译 摘译 投行 研究机构",
+            f"site:mp.weixin.qq.com {req.industry} Bernstein 伯恩斯坦 SemiAnalysis Semianalysis",
+            f"site:mp.weixin.qq.com {req.industry} Goldman Sachs 高盛 Morgan Stanley 摩根士丹利 JP Morgan 摩根大通",
+            f"site:mp.weixin.qq.com {req.industry} Omdia Yole Gartner IDC TrendForce TechInsights LightCounting",
             f"site:mp.weixin.qq.com {req.industry} 国产替代 风险 反证",
             f"site:mp.weixin.qq.com {req.industry} 材料 工艺 瓶颈 良率 客户认证",
             f"site:mp.weixin.qq.com {req.industry} 专利 论文 拆解 供应链 最新",
@@ -858,8 +876,40 @@ def source_relevance_score(industry: str, title: str, url: str, snippet: str = "
     if any(term in text for term in unrelated_terms):
         score -= 8
     if "mp.weixin.qq.com" in host:
-        score += 4
+        score += 4 + wechat_quality_bonus(title, snippet)
     return score
+
+
+def wechat_quality_bonus(title: str, snippet: str = "") -> int:
+    text = f"{title} {snippet}".lower()
+    high_value_patterns = [
+        r"调研纪要", r"专家纪要", r"专家访谈", r"电话会", r"交流纪要", r"路演纪要",
+        r"产业链调研", r"公司调研", r"机构调研", r"投资者交流", r"纪要全文",
+        r"海外研报", r"研报翻译", r"翻译", r"摘译", r"译文", r"投行", r"卖方",
+        r"goldman", r"高盛", r"morgan stanley", r"摩根士丹利", r"j\.?p\.? morgan", r"摩根大通",
+        r"bernstein", r"伯恩斯坦", r"semianalysis", r"semi analysis", r"semi-analysis",
+        r"yole", r"omdia", r"gartner", r"idc", r"trendforce", r"counterpoint", r"techinsights", r"lightcounting",
+        r"bofa", r"ubs", r"citi", r"jefferies", r"barclays", r"berenberg",
+    ]
+    weak_patterns = [
+        r"课程", r"训练营", r"社群", r"招商", r"广告", r"软文", r"荐股", r"牛股",
+        r"涨停", r"翻倍", r"财富密码", r"必看", r"震惊", r"付费阅读", r"带货",
+    ]
+    bonus = sum(2 for pattern in high_value_patterns if re.search(pattern, text, re.I))
+    penalty = sum(2 for pattern in weak_patterns if re.search(pattern, text, re.I))
+    return max(-6, min(16, bonus - penalty))
+
+
+def classify_wechat_quality(title: str, snippet: str = "") -> tuple[str, str]:
+    bonus = wechat_quality_bonus(title, snippet)
+    text = f"{title} {snippet}"
+    if bonus >= 8:
+        return "高价值公众号线索", "调研纪要/海外机构摘译/头部机构观点类公众号线索；可用于发现深层变量，但强结论仍需追踪原始报告或 T0/T1/T2 来源。"
+    if bonus >= 3:
+        return "中价值公众号线索", "可能包含产业线索或机构转述；需交叉验证后才能进入核心结论。"
+    if re.search(r"课程|训练营|社群|招商|广告|软文|荐股|牛股|涨停|翻倍|财富密码|付费阅读|带货", text, re.I):
+        return "低价值公众号线索", "营销/荐股/课程倾向明显，只能作为噪声或情绪观察，不得支撑结论。"
+    return "普通公众号线索", "适合发现中国市场线索、专家观点和争议点；不得单独支撑强结论。"
 
 
 def source_profile(industry: str, title: str, url: str, snippet: str = "", relevance: int | None = None) -> dict[str, Any]:
@@ -909,12 +959,13 @@ def source_profile(industry: str, title: str, url: str, snippet: str = "", relev
         use_policy = "可支撑新闻事件和产业观点；重大数字需一手来源或数据机构交叉验证。"
     elif "mp.weixin.qq.com" in host:
         tier = "T3"
-        channel = "微信公众号/产业线索"
-        use_policy = "适合发现中国市场线索、专家访谈和争议点；不得单独支撑强结论。"
+        channel, use_policy = classify_wechat_quality(title, snippet)
     depth_hits = len(re.findall(r"材料|工艺|专利|论文|良率|可靠性|阻抗|电极|界面|封装|客户认证|供应商|拆解|patent|paper|yield|reliability|electrode|interface|substrate|packaging|supplier|teardown|certification", text, re.I))
     recency_hits = len(re.findall(r"2026|2025|最新|recent|latest|announces|launches|published|pubdate", text, re.I))
     primary_bonus = {"T0": 18, "T1": 12, "T2": 6, "T3": 1}.get(tier, 0)
     evidence_density = relevance_score * 2 + authority * 3 + primary_bonus + min(depth_hits, 8) * 3 + min(recency_hits, 4) * 2
+    if "mp.weixin.qq.com" in host:
+        evidence_density += wechat_quality_bonus(title, snippet) * 2
     if is_search_entry:
         evidence_density -= 8
     if is_low_value_domain(host):
@@ -926,6 +977,9 @@ def source_profile(industry: str, title: str, url: str, snippet: str = "", relev
         density_band = "中"
     else:
         density_band = "低"
+    if "mp.weixin.qq.com" in host and channel == "低价值公众号线索":
+        density_band = "低"
+        evidence_density = min(evidence_density, 12)
 
     return {
         "source_tier": tier,
@@ -1006,7 +1060,7 @@ def classify_source_type(url: str) -> str:
     host = urlparse(url).netloc.lower().removeprefix("www.")
     path = urlparse(url).path.lower()
     if "mp.weixin.qq.com" in host:
-        return "B/C 微信公众号/产业文章，需交叉验证"
+        return "C/T3 微信公众号线索，需按调研纪要/机构转述/普通观点继续分层并交叉验证"
     if host.endswith((".gov", ".edu")) or ".gov." in host:
         return "S 政府/监管/高校"
     if any(token in host for token in ["sec.gov", "sse.com.cn", "szse.cn", "hkexnews.hk", "cninfo.com.cn"]):
@@ -1673,7 +1727,7 @@ def call_chat_compatible(req: ReportRequest, api_key: str) -> tuple[str, list[di
         prompt += f"""
 
 以下是工具预先检索和抓取的公开来源。第一步必须做来源相关性审查：若来源与「{req.industry}」无关、是电商/歌词/视频/地图/登录页/论坛噪声，必须在引用审计中列为“剔除来源”，正文不得引用其事实。请优先使用相关来源，并在正文中使用这些 URL 做可点击引用。若某个重要结论无法由来源支持，必须标注“证据不足/低置信度”，但不要因为部分来源无效而终止全文；应输出“证据受限版研报”，把强结论降级为待核验假设。
-微信公众号优先规则：若来源中包含 mp.weixin.qq.com，可优先用于发现中国市场产业线索、专家观点、公司动态和争议点；但在证据分级中必须标注为 B/C 或 C，所有市场规模、份额、融资估值、客户订单、全球第一/独家/垄断等强结论必须由公告、年报、政策原文、论文、权威数据机构或主流财经媒体交叉验证。
+微信公众号优先规则：若来源中包含 mp.weixin.qq.com，必须先看信息源渠道字段。高价值公众号线索（调研纪要、专家访谈、电话会、产业链纪要、海外投行/研究机构翻译摘译、SemiAnalysis/Bernstein 等）可优先用于发现深层变量和争议点；普通观点号只作背景；营销/荐股/课程号应剔除或降权。所有市场规模、份额、融资估值、客户订单、财务、全球第一/独家/垄断等强结论必须由公告、年报、政策原文、论文、权威数据机构或主流财经媒体交叉验证。
 硬性要求：执行摘要每条尽量使用 2 个 Markdown 链接；每个关键表格的“来源”列必须使用 Markdown 链接或写“证据不足”；引用审计表的 URL 列必须使用 Markdown 链接。
 
 {source_context}
@@ -1779,7 +1833,7 @@ def build_chat_source_prompt(req: ReportRequest) -> tuple[str, list[dict[str, st
         prompt += f"""
 
 以下是工具预先检索和抓取的公开来源。第一步必须做来源相关性审查：若来源与「{req.industry}」无关、是电商/歌词/视频/地图/登录页/论坛噪声，必须在引用审计中列为“剔除来源”，正文不得引用其事实。请优先使用相关来源，并在正文中使用这些 URL 做可点击引用。若某个重要结论无法由来源支持，必须标注“证据不足/低置信度”，但不要因为部分来源无效而终止全文；应输出“证据受限版研报”，把强结论降级为待核验假设。
-微信公众号优先规则：若来源中包含 mp.weixin.qq.com，可优先用于发现中国市场产业线索、专家观点、公司动态和争议点；但在证据分级中必须标注为 B/C 或 C，所有市场规模、份额、融资估值、客户订单、全球第一/独家/垄断等强结论必须由公告、年报、政策原文、论文、权威数据机构或主流财经媒体交叉验证。
+微信公众号优先规则：若来源中包含 mp.weixin.qq.com，必须先看信息源渠道字段。高价值公众号线索（调研纪要、专家访谈、电话会、产业链纪要、海外投行/研究机构翻译摘译、SemiAnalysis/Bernstein 等）可优先用于发现深层变量和争议点；普通观点号只作背景；营销/荐股/课程号应剔除或降权。所有市场规模、份额、融资估值、客户订单、财务、全球第一/独家/垄断等强结论必须由公告、年报、政策原文、论文、权威数据机构或主流财经媒体交叉验证。
 硬性要求：执行摘要每条尽量使用 2 个 Markdown 链接；每个关键表格的“来源”列必须使用 Markdown 链接或写“证据不足”；引用审计表的 URL 列必须使用 Markdown 链接。
 
 {source_context}
