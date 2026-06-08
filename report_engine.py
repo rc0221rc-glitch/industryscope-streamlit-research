@@ -140,6 +140,18 @@ HIGH_VALUE_WECHAT_RULES = """
 """
 
 
+COMPANY_AND_INFLECTION_RULES = """
+厂商深研与行业拐点规则（必须执行）：
+1. 目标行业的国内外厂商不得只做示意性列举。必须输出“全球厂商雷达”和“中国厂商雷达”，并按价值链层级拆分：上游材料/设备/工具、核心部件或芯片/器件、中游集成/封装/模块/系统、下游客户/渠道/生态。
+2. 每家重点厂商至少比较以下维度：价值链位置、技术路线或产品路线、核心产品/规格/性能指标、客户或应用场景、量产/交付/认证阶段、成本/良率/可靠性能力、供应链控制点、商业模式、收入/订单/融资/估值/上市状态、最近 180/90/30 天进展、优势、短板、反证和可验证来源。
+3. 厂商进展本身是技术路线进展的证据。必须把公司公告、年报/招股书、投资者材料、专利、论文、招聘、产线/扩产、客户导入、融资并购、供应商认证映射回技术路线：说明该进展证明了路线的哪一层成熟，仍不能证明什么。
+4. 厂商比较必须回答“差异到底在哪个层面”：材料体系、器件结构、工艺窗口、设备/产线、良率、可靠性、成本曲线、客户认证、软件/算法、数据、渠道、资金和组织能力。不要只写“技术领先/生态强/成本低”这类空话。
+5. 对新兴产业和未来产业，必须输出“拐点时间表与先决条件闸门”。至少分 0-12 个月、12-24 个月、24-36 个月、36 个月以上四个窗口，判断每个窗口发生商业化拐点的概率、触发条件、领先指标和失败信号。
+6. 拐点先决条件必须分层：商业层面（客户 ROI、采购预算、订单/复购、价格带、渠道、监管支付/补贴）、技术层面（性能阈值、可靠性、寿命、良率、认证、TRL/MRL、标准）、供应链层面（关键材料/设备/产能/良率/国产化/交期/成本曲线/上游成熟度）、资本层面（融资窗口、产能 CAPEX、现金流、上市/退出）、政策与地缘层面。
+7. 未来拐点只能写成情景和概率，不得写成确定事实。每个拐点判断必须标注证据、反证和需要继续跟踪的数据源。
+"""
+
+
 SECTION_TASKS = """
 分章任务卡（每章都要按任务执行）：
 
@@ -147,10 +159,10 @@ SECTION_TASKS = """
 写一段“为什么这个行业边界容易被误读”。定义核心对象、价值链位置、包含/排除范围、相邻概念映射表。对于相邻概念，说明它们是上游、下游、替代、互补还是不同统计口径。随后输出多立场问题矩阵，必须同时覆盖 PE/VC、产业方、二级市场、战略咨询、技术评估、客户/采购方、怀疑者/空头七种视角。
 
 ## 核心问题
-提出 5-7 个真正影响投资判断的问题，覆盖：需求确定性、技术路线胜率、供应链瓶颈、竞争格局、利润池、估值/退出、监管/地缘。每个问题说明为什么它重要。
+提出 6-8 个真正影响投资判断的问题，覆盖：需求确定性、技术路线胜率、供应链瓶颈、厂商差异、竞争格局、拐点时间、利润池、估值/退出、监管/地缘。每个问题说明为什么它重要。
 
 ## 研究计划与检索策略
-先输出一张研究计划表：研究问题、需要的证据类型、优先来源、检索关键词、若找不到证据如何降级结论。关键词必须覆盖中英文、公司公告、政策/监管、论文/会议、市场数据、反证/失败案例。
+先输出一张研究计划表：研究问题、需要的证据类型、优先来源、检索关键词、若找不到证据如何降级结论。关键词必须覆盖中英文、公司公告、年报/招股书、投资者材料、融资数据库/新闻、政策/监管、专利、论文/会议、市场数据、招聘、客户导入、产线/扩产、反证/失败案例。
 
 ## 执行摘要
 输出 6-8 条结论，每条必须包含：一句话判断、2-3 个可点击证据、置信度、最大反证/失败条件、未来 6-18 个月要跟踪的信号。禁止没有证据的口号式结论。
@@ -171,10 +183,13 @@ SECTION_TASKS = """
 至少列 2-3 个来源的市场规模预测，逐一写明口径差异。拆解需求公式：终端需求 × 单机用量/渗透率 × ASP/价格趋势。单独列“不能使用的口径”。
 
 ## 技术路线对比
-比较主路线、替代路线和相邻路线：工作原理、可量产性、成本结构、性能上限、供应链、代表企业、客户采用、二阶问题。不要只写优缺点，要写“什么条件下路线会赢/输”。
+比较主路线、替代路线和相邻路线：工作原理、可量产性、成本结构、性能上限、供应链、代表企业、客户采用、二阶问题。不要只写优缺点，要写“什么条件下路线会赢/输”，并把厂商最新进展映射到路线成熟度：该进展证明了什么、还不能证明什么。
 
-## 竞争格局
-按价值链分层：上游材料/设备、芯片/器件、封装/模块、系统/客户。每层分别列全球与中国代表公司。份额类结论必须有分母和来源；没有硬数据时用“公开证据显示领先/活跃”，不要写精确份额。
+## 竞争格局与厂商深度比较
+不得只示意性列举代表企业。必须先按价值链分层：上游材料/设备/工具、核心部件或芯片/器件、中游集成/封装/模块/系统、下游客户/渠道/生态。每层分别列全球与中国代表公司。随后输出至少两张表：“全球重点厂商深度比较”和“中国重点厂商深度比较”。每家厂商必须覆盖：价值链位置、技术/产品路线、核心产品或指标、量产/认证/客户阶段、最新业务/技术/融资/产线/专利进展、竞争优势、短板、与技术路线的关系、证据链接。份额类结论必须有分母和来源；没有硬数据时用“公开证据显示领先/活跃”，不要写精确份额。
+
+## 厂商进展与技术路线映射
+输出表格：厂商、最新进展、进展类型（业务/技术/融资/客户/产线/专利/招聘）、对应技术路线或价值链层级、说明其证明了什么成熟度、仍不能证明什么、下一步跟踪信号、来源。国内外厂商都要覆盖；证据不足的厂商列入“待核验厂商清单”，不得编造。
 
 ## 产业链与利润池
 画文字版产业链图谱，标注卡点、国产化率、毛利区间、议价权。说明利润池在何处，为什么不是概念最热的地方。
@@ -190,6 +205,9 @@ SECTION_TASKS = """
 
 ## 风险、机会与领先指标
 风险必须可观测。每个机会对应一个反证。领先指标要具体到“看什么公告/财报科目/客户认证/招标/良率/ASP/库存/产能”。
+
+## 拐点时间表与先决条件
+对新兴产业/未来产业必须输出。按 0-12 个月、12-24 个月、24-36 个月、36 个月以上拆分商业化或产业拐点窗口。每个窗口必须列：拐点假设、发生概率/置信度、商业先决条件、技术先决条件、供应链/上游成熟度先决条件、资本/政策条件、领先指标、失败信号、证据与反证。不得把未来拐点写成确定事实。
 
 ## 投资结论
 输出 bull/base/bear 三情景，并给出触发条件、对应标的类型、应避免的标的类型。最后列“本报告最不确定的 5 个判断”。
@@ -224,12 +242,14 @@ REPORT_OUTLINE = """
 ## 当前水平与核心瓶颈
 ## 市场规模、口径冲突与需求驱动
 ## 技术路线或产品路线对比
-## 竞争格局与代表企业
+## 竞争格局与厂商深度比较
+## 厂商进展与技术路线映射
 ## 产业链图谱与价值分配
 ## 成本结构与单位经济
 ## 政策、监管与地缘因素
 ## 投融资、财务与估值
 ## 风险、机会与领先指标
+## 拐点时间表与先决条件
 ## 投资/战略结论
 ## 引用审计表
 ## 信息源渠道分层复盘
@@ -480,6 +500,8 @@ def build_prompt(req: ReportRequest) -> str:
 
 {HIGH_VALUE_WECHAT_RULES}
 
+{COMPANY_AND_INFLECTION_RULES}
+
 {SECTION_TASKS}
 
 请优先搜索 2024-2026 年最新资料，尤其是当前日期之前最近 180/90/30 天的新动作；涉及历史沿革时可使用更早资料。你的模型内置知识可能早于当前日期，因此所有“最新、最近、今年、上月、本月、新动作”都必须以实时来源或用户指定来源为准。
@@ -729,6 +751,8 @@ def build_research_queries(req: ReportRequest, aliases: list[str]) -> list[str]:
             f"site:mp.weixin.qq.com {req.industry} Omdia Yole Gartner IDC TrendForce TechInsights LightCounting",
             f"site:mp.weixin.qq.com {req.industry} 国产替代 风险 反证",
             f"site:mp.weixin.qq.com {req.industry} 材料 工艺 瓶颈 良率 客户认证",
+            f"site:mp.weixin.qq.com {req.industry} 厂商 对比 进展 融资 客户",
+            f"site:mp.weixin.qq.com {req.industry} 拐点 量产 商业化 先决条件",
             f"site:mp.weixin.qq.com {req.industry} 专利 论文 拆解 供应链 最新",
             f"site:mp.weixin.qq.com {req.industry} 专利报告 专利分析 专利布局 专利导航",
             f"site:mp.weixin.qq.com {req.industry} 知识产权 白皮书 专利预警 FTO",
@@ -743,8 +767,17 @@ def build_research_queries(req: ReportRequest, aliases: list[str]) -> list[str]:
         f"{req.industry} 政策 监管 标准 产业规划 2025 2026",
         f"{req.industry} 投融资 并购 IPO 估值 2025 2026",
         f"{req.industry} 上市公司 年报 财报 投资者关系 2025 2026",
+        f"{req.industry} 国内外厂商 对比 竞争优势 技术路线 客户 2026",
+        f"{req.industry} 重点公司 最新进展 产品路线 融资 产线 客户认证 2026",
+        f"{req.industry} 代表企业 年报 招股书 投资者材料 产品 产能 客户",
+        f"{core} leading companies competitors product roadmap funding customers 2026",
+        f"{core} startup funding product launch customer validation production line 2025 2026",
         f"{req.industry} 失败 风险 瓶颈 良率 成本 客户认证",
         f"{req.industry} 材料 工艺 设备 良率 可靠性 封装 量产 瓶颈",
+        f"{req.industry} 行业拐点 商业化 量产 时间表 先决条件",
+        f"{req.industry} 商业化拐点 客户ROI 客户 ROI 技术成熟度 供应链成熟度 上游材料",
+        f"{core} inflection point commercialization timeline prerequisites supply chain maturity",
+        f"{core} adoption curve customer ROI technical readiness manufacturing readiness",
         f"{req.industry} 专利 论文 会议 招聘 供应商 客户认证",
         f"{req.industry} 专利报告 专利分析报告 专利布局报告 专利导航报告",
         f"{req.industry} 知识产权报告 专利预警报告 专利地图 专利族 申请趋势",
@@ -858,9 +891,14 @@ def source_relevance_score(industry: str, title: str, url: str, snippet: str = "
         "yield", "reliability", "impedance", "electrode", "interface", "sensor",
         "substrate", "interposer", "via", "rdl", "packaging", "supplier", "customer",
         "certification", "qualification", "recruiting", "job", "conference", "teardown",
+        "competitor", "competition", "vendor", "manufacturer", "startup", "funding", "financing",
+        "product roadmap", "customer validation", "commercialization", "inflection point",
+        "adoption curve", "technical readiness", "manufacturing readiness", "supply chain maturity",
         "材料", "工艺", "专利", "论文", "综述", "良率", "可靠性", "阻抗", "电极",
         "专利报告", "专利导航", "专利地图", "专利布局", "专利预警", "知识产权", "专利族", "申请趋势",
         "界面", "传感器", "基板", "通孔", "供应商", "客户认证", "招聘", "会议", "拆解",
+        "厂商", "公司", "竞争", "竞品", "融资", "估值", "客户导入", "商业化", "拐点", "先决条件",
+        "技术成熟度", "供应链成熟度", "上游成熟度", "量产", "产线", "扩产",
         "最新", "进展", "动作", "量产", "试产", "产线",
         "emg", "semg", "electromyography", "wristband", "neural", "dlc", "diamond-like carbon",
         "dry electrode", "skin-electrode", "肌电", "手环", "腕带", "类金刚石碳", "干电极",
@@ -1358,7 +1396,7 @@ def google_news_rss_search(query: str) -> list[dict[str, str]]:
 
 
 def query_needs_academic_search(query: str) -> bool:
-    return bool(re.search(r"论文|专利|专利报告|专利导航|专利地图|专利预警|知识产权|专利族|材料|工艺|良率|可靠性|review|paper|patent|patent landscape|patent insight|patent portfolio|freedom to operate|\bfto\b|intellectual property|material|process|yield|reliability|electrode|substrate|IEEE|Nature|SPIE|OFC", query, re.I))
+    return bool(re.search(r"论文|专利|专利报告|专利导航|专利地图|专利预警|知识产权|专利族|材料|工艺|良率|可靠性|技术成熟度|供应链成熟度|review|paper|patent|patent landscape|patent insight|patent portfolio|freedom to operate|\bfto\b|intellectual property|material|process|yield|reliability|electrode|substrate|technical readiness|manufacturing readiness|supply chain maturity|IEEE|Nature|SPIE|OFC", query, re.I))
 
 
 def query_needs_open_source_search(query: str) -> bool:
@@ -2247,6 +2285,16 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
     has_recency_section = any(term in markdown_text for term in ["最新动作", "信息时效", "最近 180 天", "最近180天", "最近 90 天", "最近90天", "最近 30 天", "最近30天"])
     has_source_tiering = any(term in markdown_text for term in ["信息源渠道分层", "信息源分层", "信息浓度", "T0", "T1", "T2", "T3"])
     has_rejected_sources = any(term in markdown_text for term in ["剔除来源", "低相关来源", "来源相关性审查"])
+    has_company_deep_compare = (
+        any(term in markdown_text for term in ["厂商深度比较", "全球重点厂商", "中国重点厂商", "厂商雷达"])
+        and any(term in markdown_text for term in ["竞争优势", "短板", "技术路线", "客户", "融资", "产线", "量产"])
+    )
+    has_company_progress_map = any(term in markdown_text for term in ["厂商进展与技术路线映射", "进展类型", "证明了什么成熟度", "仍不能证明什么", "待核验厂商"])
+    has_inflection_gate = (
+        any(term in markdown_text for term in ["拐点时间表", "先决条件", "拐点窗口"])
+        and any(term in markdown_text for term in ["0-12", "12-24", "24-36", "36 个月", "36个月"])
+        and any(term in markdown_text for term in ["商业先决条件", "技术先决条件", "供应链", "上游成熟度", "失败信号"])
+    )
     strong_patterns = ["全球\\s*第一", "独家", "垄断", "唯一", "确定性\\s*极高", "必然", "毁灭性", "订单\\s*排至", "市占率\\s*第一"]
     strong_term_hits = []
     for pattern in strong_patterns:
@@ -2285,6 +2333,12 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
         warnings.append("未检测到深信号/隐藏拐点小节，可能漏掉材料、工艺、专利、客户认证等关键变量。")
     if not has_recency_section:
         warnings.append("未检测到最新动作/信息时效小节，可能漏掉最近 30/90/180 天更新。")
+    if not has_company_deep_compare:
+        warnings.append("未检测到足够深入的国内外厂商对比，需逐家公司比较技术路线、客户、量产、融资、优势与短板。")
+    if not has_company_progress_map:
+        warnings.append("未检测到厂商进展与技术路线映射，可能没有把公司进展转化为路线成熟度证据。")
+    if not has_inflection_gate:
+        warnings.append("未检测到拐点时间表与先决条件闸门，需覆盖商业、技术、供应链/上游成熟度和失败信号。")
     if not has_source_tiering:
         warnings.append("未检测到信息源渠道分层复盘，建议说明 T0/T1/T2/T3 来源如何支撑结论。")
     if sources and not has_rejected_sources:
@@ -2307,6 +2361,9 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
         "has_recency_section": has_recency_section,
         "has_source_tiering": has_source_tiering,
         "has_rejected_sources": has_rejected_sources,
+        "has_company_deep_compare": has_company_deep_compare,
+        "has_company_progress_map": has_company_progress_map,
+        "has_inflection_gate": has_inflection_gate,
         "strong_term_hits": strong_term_hits,
         "weak_source_hits": weak_source_hits,
         "evidence_hygiene_hits": evidence_hygiene_hits,
@@ -2417,8 +2474,16 @@ def sample_report(req: ReportRequest) -> tuple[str, list[dict[str, str]]]:
 | 路线 B | 低-中 | 性能上限高 | 供应链不稳 | 待检索 | 是否只是实验室领先 |
 | 路线 C | 高 | 产业链成熟 | 利润率下降 | 待检索 | 是否会被新路线替代 |
 
-## 竞争格局与代表企业
-正式模式会对全球、中国、上游、中游、下游分别列出代表企业，并尽量使用公司公告、年报、招股书和权威数据库。
+## 竞争格局与厂商深度比较
+正式模式会对全球、中国、上游、中游、下游分别列出代表企业，并逐家公司比较技术路线、产品指标、客户阶段、量产/认证、融资/财务、最新进展、优势和短板。
+
+| 厂商 | 价值链位置 | 技术/产品路线 | 最新进展 | 优势 | 短板 | 来源 |
+|---|---|---|---|---|---|---|
+| 全球厂商 A | 待检索 | 待检索 | 正式模式检索公司公告/年报/专利/融资 | 待检索 | 待检索 | 用户需实时生成 |
+| 中国厂商 B | 待检索 | 待检索 | 正式模式检索招股书/公告/公众号纪要 | 待检索 | 待检索 | 用户需实时生成 |
+
+## 厂商进展与技术路线映射
+正式模式会把公司公告、融资、产线、客户认证、招聘、专利和论文映射到技术路线成熟度，区分“证明了什么”和“仍不能证明什么”。
 
 ## 产业链图谱与价值分配
 上游关注资源、材料、设备和核心零部件；中游关注产品集成、软件、平台与工程化；下游关注客户预算、采购周期、认证壁垒与替代方案。
@@ -2435,6 +2500,12 @@ def sample_report(req: ReportRequest) -> tuple[str, list[dict[str, str]]]:
 - 供给风险：核心设备、材料或人才受限。
 - 资本风险：估值提前透支商业化。
 - 领先指标：订单、认证、良率、毛利率、客户复购、政策审批、头部客户导入。
+
+## 拐点时间表与先决条件
+| 时间窗口 | 拐点假设 | 商业先决条件 | 技术先决条件 | 供应链/上游成熟度 | 失败信号 |
+|---|---|---|---|---|---|
+| 0-12 个月 | 待检索 | 客户 ROI/预算验证 | 性能与可靠性达标 | 关键材料/设备交期稳定 | 订单取消或认证推迟 |
+| 12-24 个月 | 待检索 | 复购/规模订单 | 良率和成本下降 | 产能爬坡 | 库存上升、价格战 |
 
 ## 投资/战略结论
 | 情景 | 判断 | 触发条件 |
