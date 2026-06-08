@@ -11,6 +11,7 @@ from report_engine import (
     call_model,
     ensure_clickable_source_section,
     filename_safe,
+    build_source_pdf_package,
     get_provider_api_key,
     render_report_html,
     report_quality,
@@ -215,6 +216,7 @@ def ensure_state() -> None:
         "sources": [],
         "raw_response": {},
         "last_request": None,
+        "source_package": b"",
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -236,6 +238,7 @@ def generate(req: ReportRequest, manual_key: str, demo_mode: bool) -> None:
         st.session_state["markdown"] = markdown_text
         st.session_state["sources"] = sources
         st.session_state["html"] = render_report_html(markdown_text, req, sources)
+        st.session_state["source_package"] = build_source_pdf_package(sources, req, st.session_state["html"], markdown_text)
         st.session_state["raw_response"] = {"mode": "demo"}
         st.session_state["last_request"] = req
         st.toast("已生成示例报告。填写 API Key 后可生成实时研报。")
@@ -248,9 +251,12 @@ def generate(req: ReportRequest, manual_key: str, demo_mode: bool) -> None:
         markdown_text = ensure_clickable_source_section(markdown_text, sources)
         progress.progress(78, text="正在渲染 HTML")
         html_text = render_report_html(markdown_text, req, sources)
+        progress.progress(88, text="正在生成来源快照 PDF 证据包")
+        source_package = build_source_pdf_package(sources, req, html_text, markdown_text)
         st.session_state["markdown"] = markdown_text
         st.session_state["sources"] = sources
         st.session_state["html"] = html_text
+        st.session_state["source_package"] = source_package
         st.session_state["raw_response"] = raw
         st.session_state["last_request"] = req
         progress.progress(100, text="生成完成")
@@ -270,6 +276,7 @@ def render_result() -> None:
     markdown_text = st.session_state.get("markdown", "")
     html_text = st.session_state.get("html", "")
     sources = st.session_state.get("sources", [])
+    source_package = st.session_state.get("source_package", b"")
     req = st.session_state.get("last_request")
 
     if not markdown_text:
@@ -292,7 +299,7 @@ def render_result() -> None:
 
     safe_name = filename_safe(req.industry if req else "industry_report")
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    c1, c2, c3 = st.columns([1, 1, 1])
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
     c1.download_button(
         "下载 HTML",
         data=html_text.encode("utf-8"),
@@ -314,6 +321,16 @@ def render_result() -> None:
         mime="application/json",
         use_container_width=True,
     )
+    if source_package:
+        c4.download_button(
+            "下载完整证据包 ZIP",
+            data=source_package,
+            file_name=f"{safe_name}_evidence_pack_{stamp}.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+    else:
+        c4.info("暂无证据包")
 
     tab_report, tab_markdown, tab_sources, tab_prompt = st.tabs(["HTML 预览", "Markdown", "来源", "提示词"])
     with tab_report:
@@ -336,7 +353,7 @@ def main() -> None:
 
     st.title("IndustryScope 行业深研生成器")
     caption_suffix = st.secrets.get("CAPTION_SUFFIX", os.getenv("CAPTION_SUFFIX", ""))
-    st.caption(f"输入行业，生成带可点击引用、引用审计和 HTML 下载的深度研究报告。{caption_suffix}")
+    st.caption(f"输入行业，生成带可点击引用、引用审计、HTML 下载和来源 PDF 证据包的深度研究报告。{caption_suffix}")
 
     left, right = st.columns([1, 1])
     with left:

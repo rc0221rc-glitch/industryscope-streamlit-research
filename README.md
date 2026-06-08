@@ -82,5 +82,6 @@ streamlit run app.py
 - 使用 `Scrapling Selector + trafilatura + BeautifulSoup` 三层正文抽取：优先识别微信公众号、新闻、研报、公告正文容器；失败时回退通用正文抽取，避免把搜索摘要、导航页或电商页当证据
 - 强制输出可点击引用
 - HTML 单文件导出
+- 生成完整证据包 ZIP：包含报告 HTML/Markdown、请求参数、来源索引，以及每条信息源的 PDF 文本快照；原始链接拒绝嵌入或打不开时仍可离线审计来源摘要和抓取状态
 - 引用审计表与质量检查
 - 无 API Key 时提供本地示例报告，方便预览样式

@@ -5,11 +5,13 @@ import json
 import os
 import re
 import time
+from io import BytesIO
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Any
 from xml.etree import ElementTree as ET
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import markdown as markdown_lib
 import requests
@@ -1720,6 +1722,191 @@ def fetch_source_text(url: str, timeout: int = 15) -> str:
     return text
 
 
+def source_snapshot_text(source: dict[str, str], idx: int, industry: str = "", per_source_chars: int = 9000) -> tuple[str, str]:
+    title = source.get("title") or source.get("url") or f"Source {idx}"
+    url = source.get("url", "")
+    snippet = source.get("snippet", "")
+    extraction_method = "not fetched"
+    body = ""
+    try:
+        body, extraction_method = fetch_source_text_with_method(url, timeout=18)
+        body = body[:per_source_chars]
+        if industry and body and source_relevance_score(industry, title, url, body) < 2:
+            extraction_method += "; relevance guard triggered"
+            body = "抓取到的正文与研究行业关键词匹配度较低，已作为低置信度快照保留。请打开原始链接人工核验。"
+    except Exception as exc:
+        extraction_method = f"fetch failed: {type(exc).__name__}: {exc}"
+        body = ""
+
+    if not body:
+        body = snippet or "未能抽取可读正文；本快照仅保留来源元数据、检索摘要和抓取状态。"
+
+    lines = [
+        f"S{idx} {title}",
+        "",
+        f"URL: {url}",
+        f"访问/快照时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"来源类型: {classify_source_type(url)}",
+        f"信息源分层: {source.get('source_tier', 'T3')} / {source.get('source_channel', '普通网页/候选线索')}",
+        f"信息浓度: {source.get('density_band', '未评分')}（分数 {source.get('evidence_density', '0')}）",
+        f"相关性评分: {source.get('relevance', '未评分')}",
+        f"抓取方式/状态: {extraction_method}",
+        f"使用约束: {source.get('use_policy') or '按来源类型决定证据强度；重大结论必须交叉验证。'}",
+        "",
+        "检索摘要:",
+        snippet or "无",
+        "",
+        "正文快照:",
+        body,
+        "",
+        "说明: 该 PDF 是 IndustryScope 自动生成的来源文本快照，供报告下载包内离线审计使用；它不替代原始网页、论文或专利原文。",
+    ]
+    return "\n".join(lines), extraction_method
+
+
+def wrap_pdf_text(text: str, font_name: str, font_size: int, max_width: float, pdfmetrics: Any) -> list[str]:
+    lines: list[str] = []
+    for paragraph in text.splitlines() or [""]:
+        paragraph = paragraph.rstrip()
+        if not paragraph:
+            lines.append("")
+            continue
+        current = ""
+        for char in paragraph:
+            candidate = current + char
+            if pdfmetrics.stringWidth(candidate, font_name, font_size) <= max_width:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                current = char
+        if current:
+            lines.append(current)
+    return lines
+
+
+def text_to_pdf_bytes(title: str, text: str) -> bytes:
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.pdfgen import canvas
+    except Exception as exc:
+        raise RuntimeError(f"reportlab unavailable: {exc}") from exc
+
+    font_name = "Helvetica"
+    for candidate in [
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simsun.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    ]:
+        if os.path.exists(candidate):
+            try:
+                pdfmetrics.registerFont(TTFont("IndustryScopeCJK", candidate))
+                font_name = "IndustryScopeCJK"
+                break
+            except Exception:
+                continue
+    if font_name == "Helvetica":
+        try:
+            from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+
+            pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+            font_name = "STSong-Light"
+        except Exception:
+            pass
+
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    margin = 18 * mm
+    font_size = 9
+    line_height = 13
+    usable_width = width - margin * 2
+    y = height - margin
+
+    def new_page() -> None:
+        nonlocal y
+        pdf.showPage()
+        pdf.setFont(font_name, font_size)
+        y = height - margin
+
+    pdf.setTitle(title[:120])
+    pdf.setFont(font_name, 13)
+    for line in wrap_pdf_text(title, font_name, 13, usable_width, pdfmetrics)[:3]:
+        pdf.drawString(margin, y, line)
+        y -= 17
+    y -= 6
+    pdf.setFont(font_name, font_size)
+    for line in wrap_pdf_text(text, font_name, font_size, usable_width, pdfmetrics):
+        if y < margin:
+            new_page()
+        pdf.drawString(margin, y, line[:500])
+        y -= line_height
+    pdf.save()
+    return buffer.getvalue()
+
+
+def build_source_pdf_package(sources: list[dict[str, str]], req: ReportRequest | None, html_text: str = "", markdown_text: str = "") -> bytes:
+    industry = req.industry if req else ""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    buffer = BytesIO()
+    index_rows = [
+        "# IndustryScope 来源快照证据包",
+        "",
+        f"- 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- 行业: {industry or '未记录'}",
+        f"- 来源数量: {len(sources)}",
+        "",
+        "| Source | 标题 | URL | 分层 | 快照文件 |",
+        "|---|---|---|---|---|",
+    ]
+
+    with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
+        if html_text:
+            archive.writestr("report.html", html_text.encode("utf-8"))
+        if markdown_text:
+            archive.writestr("report.md", markdown_text.encode("utf-8"))
+        if req:
+            archive.writestr("request.json", request_to_json(req).encode("utf-8"))
+
+        for idx, source in enumerate(sources, start=1):
+            title = source.get("title") or f"Source {idx}"
+            url = source.get("url", "")
+            safe_title = filename_safe(title)[:70] or f"source_{idx}"
+            pdf_name = f"source_pdfs/S{idx:02d}_{safe_title}.pdf"
+            txt_name = f"source_pdfs/S{idx:02d}_{safe_title}.txt"
+            snapshot, _ = source_snapshot_text(source, idx, industry=industry)
+            try:
+                archive.writestr(pdf_name, text_to_pdf_bytes(f"S{idx} {title}", snapshot))
+                snapshot_file = pdf_name
+            except Exception as exc:
+                archive.writestr(txt_name, (snapshot + f"\n\nPDF 生成失败: {exc}").encode("utf-8"))
+                snapshot_file = txt_name
+            if url.lower().split("?")[0].endswith(".pdf"):
+                try:
+                    response = requests.get(
+                        url,
+                        headers={"User-Agent": "Mozilla/5.0", "Accept": "application/pdf,*/*;q=0.8"},
+                        timeout=20,
+                    )
+                    response.raise_for_status()
+                    if response.content.startswith(b"%PDF"):
+                        original_name = f"source_pdfs/S{idx:02d}_{safe_title}_original.pdf"
+                        archive.writestr(original_name, response.content)
+                        snapshot_file = f"{snapshot_file}<br>{original_name}"
+                except Exception:
+                    pass
+            tier = f"{source.get('source_tier', 'T3')} / {source.get('source_channel', '')}".strip()
+            index_rows.append(f"| S{idx} | {title.replace('|', '/')} | {url} | {tier.replace('|', '/')} | {snapshot_file} |")
+
+        archive.writestr("source_index.md", "\n".join(index_rows).encode("utf-8"))
+    return buffer.getvalue()
+
+
 def build_source_context(sources: list[dict[str, str]], industry: str = "", per_source_chars: int = 2400) -> str:
     blocks: list[str] = []
     tier_summary = source_tier_summary(sources)
@@ -2017,11 +2204,12 @@ def collect_sources(data: Any) -> list[dict[str, str]]:
 
 
 def render_markdown_to_html(markdown_text: str) -> str:
-    return markdown_lib.markdown(
+    rendered = markdown_lib.markdown(
         markdown_text,
         extensions=["tables", "fenced_code", "toc", "sane_lists", "nl2br"],
         output_format="html5",
     )
+    return re.sub(r'<a href="(https?://[^"]+)"', r'<a href="\1" target="_blank" rel="noopener noreferrer"', rendered)
 
 
 def ensure_clickable_source_section(markdown_text: str, sources: list[dict[str, str]] | None = None) -> str:
