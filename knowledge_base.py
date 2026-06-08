@@ -64,6 +64,7 @@ class KBDocument:
     technology_tags: str
     created_at: str
     chunk_count: int
+    source_url: str = ""
 
 
 @dataclass
@@ -83,6 +84,7 @@ class KBChunk:
     section: str
     text: str
     token_hint: int
+    source_url: str = ""
 
 
 def ensure_kb_dirs() -> None:
@@ -275,6 +277,7 @@ def add_document(
     industry_tags: str = "",
     company_tags: str = "",
     technology_tags: str = "",
+    source_url: str = "",
 ) -> KBDocument:
     ensure_kb_dirs()
     digest = file_sha256(source_path)
@@ -312,6 +315,7 @@ def add_document(
                 section=section.get("section", ""),
                 text=text,
                 token_hint=max(1, len(text) // 2),
+                source_url=source_url,
             )
             chunks.append(asdict(chunk))
 
@@ -329,6 +333,7 @@ def add_document(
         technology_tags=technology_tags,
         created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         chunk_count=len(chunks),
+        source_url=source_url,
     )
     docs[doc_id] = asdict(document)
     save_documents(docs)
@@ -456,5 +461,6 @@ def kb_results_to_sources(results: list[dict[str, Any]]) -> list[dict[str, str]]
             "kb_filename": item.get("filename", ""),
             "kb_page": item.get("page", ""),
             "kb_section": item.get("section", ""),
+            "source_url": item.get("source_url", ""),
         })
     return sources

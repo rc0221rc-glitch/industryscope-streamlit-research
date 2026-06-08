@@ -1,0 +1,271 @@
+from __future__ import annotations
+
+import html
+import re
+import tempfile
+import time
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin, urlparse
+
+import requests
+from bs4 import BeautifulSoup
+
+from knowledge_base import add_document, filename_safe
+
+
+SOGOU_WECHAT_URL = "https://weixin.sogou.com/weixin"
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Referer": "https://weixin.sogou.com/",
+}
+
+
+@dataclass
+class WechatSearchResult:
+    title: str
+    search_url: str
+    url: str
+    account: str
+    published_at: str
+    published_ts: int
+    snippet: str
+    rank: int
+    status: str = "候选"
+    error: str = ""
+
+
+@dataclass
+class WechatArticle:
+    title: str
+    url: str
+    account: str
+    published_at: str
+    content: str
+    html_title: str = ""
+
+
+def normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def clean_text(text: str) -> str:
+    text = html.unescape(text or "")
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def timestamp_to_date(value: str) -> tuple[str, int]:
+    try:
+        ts = int(value)
+    except (TypeError, ValueError):
+        return "", 0
+    if ts <= 0:
+        return "", 0
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d"), ts
+
+
+def extract_sogou_date(li: Any) -> tuple[str, int]:
+    text = str(li)
+    match = re.search(r"timeConvert\('(\d{9,11})'\)", text)
+    if match:
+        return timestamp_to_date(match.group(1))
+    match = re.search(r"\b(20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2})", li.get_text(" ", strip=True))
+    if match:
+        date = match.group(1).replace("年", "-").replace("月", "-").replace("/", "-").replace(".", "-").strip("-")
+        try:
+            parsed = datetime.strptime(date, "%Y-%m-%d")
+            return parsed.strftime("%Y-%m-%d"), int(parsed.timestamp())
+        except ValueError:
+            return date, 0
+    return "", 0
+
+
+def restore_sogou_redirect_url(script_html: str) -> str:
+    parts = re.findall(r"url\s*\+=\s*'([^']*)';", script_html or "")
+    if parts:
+        url = "".join(parts).replace("&amp;", "&")
+        url = url.replace("¡Átamp=", "&timestamp=").replace("×tamp=", "&timestamp=")
+        return url
+    match = re.search(r"https://mp\.weixin\.qq\.com/s\?[^'\"<> ]+", script_html or "")
+    if not match:
+        return ""
+    return match.group(0).replace("&amp;", "&").replace("¡Átamp=", "&timestamp=").replace("×tamp=", "&timestamp=")
+
+
+def make_sogou_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    return session
+
+
+def resolve_sogou_link(session: requests.Session, url: str, timeout: int = 15) -> str:
+    if not url:
+        return ""
+    absolute = urljoin("https://weixin.sogou.com", url)
+    if "mp.weixin.qq.com" in urlparse(absolute).netloc:
+        return absolute
+    response = session.get(absolute, timeout=timeout, allow_redirects=True)
+    response.raise_for_status()
+    if "antispider" in response.url or "请输入验证码" in response.text or "verify_page" in response.text:
+        raise RuntimeError("搜狗微信跳转页触发验证码/反爬验证，无法自动解析真实微信链接。请稍后重试，或手动打开候选文章后复制 mp.weixin.qq.com 链接入库。")
+    if "mp.weixin.qq.com" in urlparse(response.url).netloc:
+        return response.url
+    resolved = restore_sogou_redirect_url(response.text)
+    if not resolved:
+        raise RuntimeError("未能从搜狗跳转页解析真实微信文章链接。")
+    return resolved
+
+
+def search_sogou_wechat(keyword: str, limit: int = 10, pages: int = 3) -> list[WechatSearchResult]:
+    session = make_sogou_session()
+    results: list[WechatSearchResult] = []
+    seen: set[str] = set()
+    rank = 0
+
+    for page in range(1, max(1, pages) + 1):
+        response = session.get(
+            SOGOU_WECHAT_URL,
+            params={
+                "type": "2",
+                "query": keyword,
+                "ie": "utf8",
+                "s_from": "input",
+                "_sug_": "n",
+                "_sug_type_": "",
+                "page": str(page),
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        if "请输入验证码" in response.text or "antispider" in response.url or "antispider" in response.text:
+            raise RuntimeError("搜狗微信搜索触发验证码/反爬验证，请稍后重试或减少搜索频率。")
+        soup = BeautifulSoup(response.text, "html.parser")
+        items = soup.select("ul.news-list li")
+        if not items:
+            break
+        for li in items:
+            anchor = li.select_one("h3 a") or li.select_one("a")
+            if not anchor:
+                continue
+            title = normalize_space(anchor.get_text(" ", strip=True))
+            href = anchor.get("href", "")
+            search_url = urljoin("https://weixin.sogou.com", href)
+            snippet_node = li.select_one(".txt-info")
+            snippet = normalize_space(snippet_node.get_text(" ", strip=True) if snippet_node else "")
+            account_node = li.select_one(".all-time-y2") or li.select_one(".account")
+            account = normalize_space(account_node.get_text(" ", strip=True) if account_node else "")
+            published_at, published_ts = extract_sogou_date(li)
+            dedupe_key = href or title
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            rank += 1
+            results.append(
+                WechatSearchResult(
+                    title=title,
+                    search_url=search_url,
+                    url="",
+                    account=account,
+                    published_at=published_at,
+                    published_ts=published_ts,
+                    snippet=snippet,
+                    rank=rank,
+                )
+            )
+        if len(results) >= limit:
+            break
+        time.sleep(0.6)
+
+    results = sorted(results, key=lambda item: (item.published_ts, -item.rank), reverse=True)
+    return results[:limit]
+
+
+def resolve_sogou_search_url(search_url: str) -> str:
+    session = make_sogou_session()
+    return resolve_sogou_link(session, search_url)
+
+
+def fetch_wechat_article(url: str, title_hint: str = "", account_hint: str = "", date_hint: str = "") -> WechatArticle:
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    response = session.get(url, timeout=18)
+    response.raise_for_status()
+    if "环境异常" in response.text or "访问过于频繁" in response.text or "验证码" in response.text:
+        raise RuntimeError("微信文章页返回环境/频率验证，无法公开抓取正文。")
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style", "noscript", "iframe", "svg"]):
+        tag.decompose()
+    title_node = soup.select_one("#activity-name")
+    account_node = soup.select_one("#js_name")
+    date_node = soup.select_one("#publish_time")
+    content_node = soup.select_one("#js_content") or soup.select_one(".rich_media_content")
+    content = clean_text(content_node.get_text("\n", strip=True) if content_node else "")
+    if len(content) < 120:
+        raise RuntimeError("未能抽取到足够长的公众号正文，可能是链接过期、需要校验或页面结构变化。")
+    return WechatArticle(
+        title=normalize_space(title_node.get_text(" ", strip=True) if title_node else title_hint),
+        url=url,
+        account=normalize_space(account_node.get_text(" ", strip=True) if account_node else account_hint),
+        published_at=normalize_space(date_node.get_text(" ", strip=True) if date_node else date_hint),
+        content=content,
+        html_title=normalize_space(soup.title.get_text(" ", strip=True) if soup.title else ""),
+    )
+
+
+def article_to_markdown(article: WechatArticle, keyword: str, search_rank: int = 0) -> str:
+    return "\n".join(
+        [
+            f"# {article.title or '微信公众号文章'}",
+            "",
+            "## 元数据",
+            f"- 原文链接：{article.url}",
+            f"- 公众号/作者：{article.account or '未识别'}",
+            f"- 发布日期：{article.published_at or '未识别'}",
+            f"- 搜索关键词：{keyword}",
+            f"- 搜索排序：{search_rank or '未记录'}",
+            "- 来源说明：由 IndustryScope 通过搜狗微信搜索发现，并从公开可访问的微信文章页面抽取正文。公众号内容质量参差不齐，强结论需与一手公开来源交叉验证。",
+            "",
+            "## 正文",
+            "",
+            article.content,
+            "",
+        ]
+    )
+
+
+def ingest_wechat_article(
+    article: WechatArticle,
+    keyword: str,
+    industry_tags: str = "",
+    company_tags: str = "",
+    technology_tags: str = "",
+    search_rank: int = 0,
+) -> dict[str, Any]:
+    markdown_text = article_to_markdown(article, keyword, search_rank=search_rank)
+    safe_name = filename_safe(article.title or f"wechat_{search_rank}")[:90]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".md", mode="w", encoding="utf-8") as tmp:
+        tmp.write(markdown_text)
+        tmp_path = Path(tmp.name)
+    try:
+        doc = add_document(
+            tmp_path,
+            title=article.title or safe_name,
+            source_type="公众号/媒体转载",
+            source_org=article.account,
+            publish_date=article.published_at,
+            industry_tags=industry_tags or keyword,
+            company_tags=company_tags,
+            technology_tags=technology_tags,
+            source_url=article.url,
+        )
+        return {"document": asdict(doc), "markdown": markdown_text}
+    finally:
+        tmp_path.unlink(missing_ok=True)

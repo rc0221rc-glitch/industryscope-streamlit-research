@@ -2463,6 +2463,7 @@ def render_kb_evidence_html(sources: list[dict[str, str]] | None) -> str:
         snippet = html.escape(source.get("snippet") or "未保存片段摘录。")
         meta_items = [
             ("内部引用", url),
+            ("原始链接", source.get("source_url", "")),
             ("文件", source.get("kb_filename", "")),
             ("文档ID", source.get("kb_doc_id", "")),
             ("片段ID", source.get("kb_chunk_id", "")),

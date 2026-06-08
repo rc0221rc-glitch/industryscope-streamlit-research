@@ -31,6 +31,12 @@ from knowledge_base import (
     load_documents,
     search_knowledge_base,
 )
+from wechat_ingest import (
+    fetch_wechat_article,
+    ingest_wechat_article,
+    resolve_sogou_search_url,
+    search_sogou_wechat,
+)
 
 
 st.set_page_config(
@@ -250,6 +256,7 @@ def ensure_state() -> None:
         "raw_response": {},
         "last_request": None,
         "source_package": b"",
+        "wechat_candidates": [],
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -385,6 +392,51 @@ def render_result() -> None:
             st.text_area("生成提示词", value=build_prompt(req), height=720)
 
 
+def ingest_wechat_candidates(
+    candidates: list[dict],
+    selected_indexes: list[int],
+    keyword: str,
+    industry_tags: str,
+    company_tags: str,
+    technology_tags: str,
+) -> tuple[int, list[str]]:
+    ok = 0
+    errors: list[str] = []
+    if not selected_indexes:
+        return ok, ["请至少选择一篇文章。"]
+    progress = st.progress(0, text="正在入库公众号文章")
+    try:
+        for order, candidate_index in enumerate(selected_indexes, start=1):
+            item = candidates[candidate_index]
+            title = item.get("title", f"公众号文章 {candidate_index + 1}")
+            try:
+                progress.progress(order / len(selected_indexes), text=f"正在处理：{title[:36]}")
+                article_url = resolve_sogou_search_url(item.get("search_url", ""))
+                if not article_url:
+                    raise RuntimeError("未能从搜狗跳转页解析真实微信文章链接。")
+                article = fetch_wechat_article(
+                    article_url,
+                    title_hint=title,
+                    account_hint=item.get("account", ""),
+                    date_hint=item.get("published_at", ""),
+                )
+                result = ingest_wechat_article(
+                    article,
+                    keyword=keyword,
+                    industry_tags=industry_tags or keyword,
+                    company_tags=company_tags,
+                    technology_tags=technology_tags,
+                    search_rank=int(item.get("rank", candidate_index + 1)),
+                )
+                ok += 1
+                st.toast(f"已入库：{result['document'].get('title', title)}")
+            except Exception as exc:
+                errors.append(f"{title}: {exc}")
+    finally:
+        progress.empty()
+    return ok, errors
+
+
 def render_knowledge_base() -> None:
     st.subheader("专属文档知识库")
     stats = kb_stats()
@@ -443,6 +495,124 @@ def render_knowledge_base() -> None:
                 if errors:
                     st.error("\n".join(errors))
 
+    with st.expander("微信公众号自动补新", expanded=False):
+        st.caption("通过搜狗微信搜索发现公开公众号文章，抓取可访问正文并生成 Markdown 文档入库。遇到验证码、过期链接或微信环境校验时会跳过并提示。")
+        col_w1, col_w2, col_w3 = st.columns([2, 1, 1])
+        with col_w1:
+            wechat_keyword = st.text_input("搜索关键词", value="", placeholder="例如：肌电手环 DLC 电极；玻璃基板封装 台积电 TGV")
+        with col_w2:
+            wechat_candidate_count = st.slider("候选篇数", 5, 30, 10, step=1)
+        with col_w3:
+            wechat_ingest_count = st.slider("默认入库最近篇数", 1, 20, 5, step=1)
+        col_tag1, col_tag2, col_tag3 = st.columns(3)
+        with col_tag1:
+            wechat_industry_tags = st.text_input("公众号入库行业标签", value="", placeholder="默认使用搜索关键词")
+        with col_tag2:
+            wechat_company_tags = st.text_input("公众号入库公司标签", value="")
+        with col_tag3:
+            wechat_technology_tags = st.text_input("公众号入库技术标签", value="")
+        manual_wechat_urls = st.text_area(
+            "手动粘贴微信文章链接（可选）",
+            value="",
+            placeholder="每行一个 mp.weixin.qq.com 链接。用于搜狗跳转触发验证码时的稳定备用入口。",
+            height=68,
+        )
+
+        if st.button("搜索并入库最近公众号文章", type="primary", use_container_width=True):
+            if not wechat_keyword.strip():
+                st.error("请先填写搜索关键词。")
+            else:
+                try:
+                    with st.spinner("正在通过搜狗微信搜索公众号文章..."):
+                        candidates = search_sogou_wechat(wechat_keyword.strip(), limit=wechat_candidate_count, pages=4)
+                    st.session_state["wechat_candidates"] = [candidate.__dict__ for candidate in candidates]
+                    if candidates:
+                        st.success(f"找到 {len(candidates)} 条候选。日期无法识别的文章会保留搜索排序。")
+                        selected_indexes = list(range(min(wechat_ingest_count, len(candidates))))
+                        ok, errors = ingest_wechat_candidates(
+                            st.session_state["wechat_candidates"],
+                            selected_indexes,
+                            keyword=wechat_keyword.strip(),
+                            industry_tags=wechat_industry_tags.strip() or wechat_keyword.strip(),
+                            company_tags=wechat_company_tags.strip(),
+                            technology_tags=wechat_technology_tags.strip(),
+                        )
+                        if ok:
+                            st.success(f"自动成功入库最近 {ok} 篇公众号文章。")
+                        if errors:
+                            st.error("\n".join(errors))
+                    else:
+                        st.warning("没有找到候选文章。可以换更具体的关键词，或稍后重试。")
+                except Exception as exc:
+                    st.session_state["wechat_candidates"] = []
+                    st.error(f"搜索失败：{exc}")
+
+        candidates = st.session_state.get("wechat_candidates", [])
+        if candidates:
+            rows = []
+            for idx, item in enumerate(candidates, start=1):
+                rows.append({
+                    "选择": idx <= wechat_ingest_count,
+                    "序号": idx,
+                    "标题": item.get("title", ""),
+                    "公众号": item.get("account", ""),
+                    "日期": item.get("published_at", "") or "未识别",
+                    "摘要": item.get("snippet", ""),
+                })
+            edited = st.data_editor(
+                rows,
+                use_container_width=True,
+                hide_index=True,
+                disabled=["序号", "标题", "公众号", "日期", "摘要"],
+                key="wechat_candidate_editor",
+            )
+            if st.button("将当前勾选候选补充入库", use_container_width=True):
+                selected_indexes = [int(row["序号"]) - 1 for row in edited if row.get("选择")]
+                ok, errors = ingest_wechat_candidates(
+                    candidates,
+                    selected_indexes,
+                    keyword=wechat_keyword.strip(),
+                    industry_tags=wechat_industry_tags.strip() or wechat_keyword.strip(),
+                    company_tags=wechat_company_tags.strip(),
+                    technology_tags=wechat_technology_tags.strip(),
+                )
+                if ok:
+                    st.success(f"成功补充入库 {ok} 篇公众号文章。")
+                if errors:
+                    st.error("\n".join(errors))
+
+        if st.button("入库手动粘贴的微信文章链接", use_container_width=True):
+            urls = [line.strip() for line in manual_wechat_urls.splitlines() if line.strip()]
+            if not urls:
+                st.error("请先粘贴至少一个微信文章链接。")
+            else:
+                ok = 0
+                errors: list[str] = []
+                progress = st.progress(0, text="正在入库手动微信链接")
+                try:
+                    for idx, url in enumerate(urls, start=1):
+                        try:
+                            progress.progress(idx / len(urls), text=f"正在抓取第 {idx} 篇")
+                            article = fetch_wechat_article(url)
+                            result = ingest_wechat_article(
+                                article,
+                                keyword=wechat_keyword.strip() or article.title,
+                                industry_tags=wechat_industry_tags.strip() or wechat_keyword.strip() or article.title,
+                                company_tags=wechat_company_tags.strip(),
+                                technology_tags=wechat_technology_tags.strip(),
+                                search_rank=idx,
+                            )
+                            ok += 1
+                            st.toast(f"已入库：{result['document'].get('title', article.title)}")
+                        except Exception as exc:
+                            errors.append(f"{url}: {exc}")
+                finally:
+                    progress.empty()
+                if ok:
+                    st.success(f"成功入库 {ok} 篇手动微信文章。")
+                if errors:
+                    st.error("\n".join(errors))
+
     docs = load_documents()
     st.subheader("已入库文档")
     if docs:
@@ -459,6 +629,7 @@ def render_knowledge_base() -> None:
                 "行业标签": doc.get("industry_tags"),
                 "公司标签": doc.get("company_tags"),
                 "技术标签": doc.get("technology_tags"),
+                "原始链接": doc.get("source_url", ""),
             })
         st.dataframe(rows, use_container_width=True, hide_index=True)
         delete_id = st.text_input("删除文档 doc_id", placeholder="粘贴上表 doc_id 后点击删除")
