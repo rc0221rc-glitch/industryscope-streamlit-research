@@ -118,12 +118,13 @@ OPEN_SOURCE_RESEARCH_METHODS = """
 RECENCY_AND_DEEP_SIGNAL_RULES = """
 最新信息与深信号挖掘规则（必须执行）：
 1. 不得依赖模型内置知识截止日期做最新判断。当前日期之后不可写成事实；当前日期之前但模型可能未知的内容，必须以实时来源或用户指定来源为准。
-2. 报告必须优先检索并审计最近 180 天、最近 90 天和最近 30 天的公开信息：公司公告、投资者材料、专利、论文、招聘、会议、供应链订单、客户认证、媒体采访、微信公众号产业文章。
+2. 报告必须优先检索并审计最近 180 天、最近 90 天和最近 30 天的公开信息：公司公告、投资者材料、专利、专利报告书/专利导航/专利分析报告、论文、招聘、会议、供应链订单、客户认证、媒体采访、微信公众号产业文章。
 3. 每个行业都必须做“隐藏拐点/深信号”挖掘，不得只停留在市场规模和竞争格局。必须追问：真正限制产品性能或商业化的材料、界面、工艺、设备、良率、可靠性、封装、算法、数据、认证、供应商和客户导入分别是什么。
 4. 任何产品型行业必须拆成“材料/核心部件/传感或执行器/芯片或控制器/封装或结构件/软件算法/数据校准/量产测试/客户认证”九层；任何制造型行业必须拆成“基材/设备/关键工艺/良率/检测/产能/客户认证/成本曲线/替代路线”九层。
 5. 对疑似关键拐点，必须输出“深信号候选表”：候选拐点、为什么可能重要、证据来源、反证、需要继续核验的关键词。即使证据不足，也要把它列为待核验假设，而不是漏掉。
-6. 示例：肌电/EMG 手环不能只写 AI 交互和 Meta 产品演示，必须检索 dry electrode、skin-electrode interface、impedance、diamond-like carbon/DLC、biocompatibility、sweat/durability、CTRL-Labs/Meta neural wristband、patent/paper 等关键词；玻璃基板封装不能只写先进封装需求，必须检索 glass core substrate、TGV、panel-level packaging、warpage、CTE、RDL、TSMC/Intel/Samsung/玻璃通孔/最新动作。
-7. 如果检索没有发现用户认为重要的材料/工艺/拐点，报告必须在“待核验清单”中显式写出“未找到足够证据，不得据此断言不存在”。
+6. 专利报告书是独立信息源类型：必须检索 patent landscape/report/analysis、freedom to operate/FTO、专利导航、专利地图、专利布局、专利预警、专利族、申请趋势、主要申请人、IPC/CPC 分类、知识产权白皮书。专利报告可用于发现技术路线、竞争布局和空白点，但具体专利权利要求仍需回到原始专利文本核验。
+7. 示例：肌电/EMG 手环不能只写 AI 交互和 Meta 产品演示，必须检索 dry electrode、skin-electrode interface、impedance、diamond-like carbon/DLC、biocompatibility、sweat/durability、CTRL-Labs/Meta neural wristband、patent/paper/patent landscape 等关键词；玻璃基板封装不能只写先进封装需求，必须检索 glass core substrate、TGV、panel-level packaging、warpage、CTE、RDL、TSMC/Intel/Samsung/玻璃通孔/最新动作/专利布局。
+8. 如果检索没有发现用户认为重要的材料/工艺/拐点，报告必须在“待核验清单”中显式写出“未找到足够证据，不得据此断言不存在”。
 """
 
 
@@ -727,6 +728,8 @@ def build_research_queries(req: ReportRequest, aliases: list[str]) -> list[str]:
             f"site:mp.weixin.qq.com {req.industry} 国产替代 风险 反证",
             f"site:mp.weixin.qq.com {req.industry} 材料 工艺 瓶颈 良率 客户认证",
             f"site:mp.weixin.qq.com {req.industry} 专利 论文 拆解 供应链 最新",
+            f"site:mp.weixin.qq.com {req.industry} 专利报告 专利分析 专利布局 专利导航",
+            f"site:mp.weixin.qq.com {req.industry} 知识产权 白皮书 专利预警 FTO",
             f"{req.industry} 微信公众号 深度研究 行业报告",
         ]
     deep_signal_queries = build_deep_signal_queries(req, aliases)
@@ -741,8 +744,16 @@ def build_research_queries(req: ReportRequest, aliases: list[str]) -> list[str]:
         f"{req.industry} 失败 风险 瓶颈 良率 成本 客户认证",
         f"{req.industry} 材料 工艺 设备 良率 可靠性 封装 量产 瓶颈",
         f"{req.industry} 专利 论文 会议 招聘 供应商 客户认证",
+        f"{req.industry} 专利报告 专利分析报告 专利布局报告 专利导航报告",
+        f"{req.industry} 知识产权报告 专利预警报告 专利地图 专利族 申请趋势",
+        f"site:cnipa.gov.cn {req.industry} 专利导航 专利分析 报告",
+        f"site:ggfw.cnipa.gov.cn {req.industry} 专利地图 专利族 IPC CPC",
+        f"site:wipo.int {core} patent landscape report patent analytics",
+        f"site:epo.org {core} patent insight report technology insight report",
         f"{req.industry} 拆解 teardown BOM 关键材料 关键部件",
         f"{req.industry} hidden bottleneck key material process patent",
+        f"{core} patent landscape report patent analysis freedom to operate",
+        f"{core} patent portfolio analysis intellectual property report",
         f"{core} market size forecast CAGR industry report 2026",
         f"{core} latest news company update 2026",
         f"{core} technology roadmap bottleneck yield cost 2025 2026",
@@ -840,10 +851,13 @@ def source_relevance_score(industry: str, title: str, url: str, snippet: str = "
         "data center", "foundry", "wafer", "chip", "chiplet", "光子", "硅光", "光芯片",
         "光模块", "光通信", "光电", "半导体", "晶圆", "封装",
         "material", "materials", "process", "patent", "paper", "review", "roadmap",
+        "patent landscape", "patent report", "patent analysis", "patent portfolio",
+        "freedom to operate", "intellectual property", "patent family", "applicant", "ipc", "cpc",
         "yield", "reliability", "impedance", "electrode", "interface", "sensor",
         "substrate", "interposer", "via", "rdl", "packaging", "supplier", "customer",
         "certification", "qualification", "recruiting", "job", "conference", "teardown",
         "材料", "工艺", "专利", "论文", "综述", "良率", "可靠性", "阻抗", "电极",
+        "专利报告", "专利导航", "专利地图", "专利布局", "专利预警", "知识产权", "专利族", "申请趋势",
         "界面", "传感器", "基板", "通孔", "供应商", "客户认证", "招聘", "会议", "拆解",
         "最新", "进展", "动作", "量产", "试产", "产线",
         "emg", "semg", "electromyography", "wristband", "neural", "dlc", "diamond-like carbon",
@@ -859,7 +873,9 @@ def source_relevance_score(industry: str, title: str, url: str, snippet: str = "
         "grandviewresearch.com", "imarcgroup.com", "intel.com", "cisco.com", "broadcom.com",
         "marvell.com", "coherent.com", "lumentum.com", "synopsys.com", "cadence.com",
         "tsmc.com", "imec-int.com", "imec.be", "imec.org", "ofcconference.org",
-        "patents.google.com", "uspto.gov", "wipo.int", "acm.org", "mdpi.com",
+        "patents.google.com", "uspto.gov", "wipo.int", "epo.org", "espacenet.com",
+        "cnipa.gov.cn", "ggfw.cnipa.gov.cn", "cponline.cnipa.gov.cn", "lens.org",
+        "patentcloud.com", "patsnap.com", "incopat.com", "acm.org", "mdpi.com",
         "about.meta.com", "tech.facebook.com", "ai.meta.com", "realitylabs.com",
         "samsung.com", "corning.com", "ajinomoto.com",
         "caict.ac.cn", "miit.gov.cn", "sse.com.cn", "szse.cn", "hkexnews.hk",
@@ -890,6 +906,7 @@ def wechat_quality_bonus(title: str, snippet: str = "") -> int:
         r"bernstein", r"伯恩斯坦", r"semianalysis", r"semi analysis", r"semi-analysis",
         r"yole", r"omdia", r"gartner", r"idc", r"trendforce", r"counterpoint", r"techinsights", r"lightcounting",
         r"bofa", r"ubs", r"citi", r"jefferies", r"barclays", r"berenberg",
+        r"专利报告", r"专利分析", r"专利布局", r"专利导航", r"专利地图", r"专利预警", r"知识产权白皮书", r"patent landscape",
     ]
     weak_patterns = [
         r"课程", r"训练营", r"社群", r"招商", r"广告", r"软文", r"荐股", r"牛股",
@@ -912,6 +929,19 @@ def classify_wechat_quality(title: str, snippet: str = "") -> tuple[str, str]:
     return "普通公众号线索", "适合发现中国市场线索、专家观点和争议点；不得单独支撑强结论。"
 
 
+def is_patent_report(title: str, url: str, snippet: str = "") -> bool:
+    text = f"{title} {url} {snippet}".lower()
+    patterns = [
+        r"专利报告", r"专利分析报告", r"专利布局报告", r"专利导航", r"专利地图",
+        r"专利预警", r"知识产权白皮书", r"知识产权报告", r"专利态势",
+        r"专利族", r"申请趋势", r"主要申请人", r"技术功效矩阵", r"ipc", r"cpc",
+        r"patent landscape", r"patent report", r"patent analysis", r"patent portfolio",
+        r"patent insight", r"patent family", r"patent map", r"freedom to operate",
+        r"\bfto\b", r"intellectual property report", r"ip landscape",
+    ]
+    return any(re.search(pattern, text, re.I) for pattern in patterns)
+
+
 def source_profile(industry: str, title: str, url: str, snippet: str = "", relevance: int | None = None) -> dict[str, Any]:
     host = urlparse(url).netloc.lower().removeprefix("www.")
     path = urlparse(url).path.lower()
@@ -929,11 +959,21 @@ def source_profile(industry: str, title: str, url: str, snippet: str = "", relev
         or bool(re.search(r"(^|/)(search|searchnews)(\.html|/|$)", path))
         or bool(query_keys & {"q", "query", "keywords", "term", "s", "searchtext"})
     )
-    if is_search_entry:
+    is_patent_report_source = is_patent_report(title, url, snippet)
+    is_patent_discovery_entry = is_patent_report_source and bool(re.search(r"search entry|series entry|report entry|official .* entry|search within|入口|报告库|检索入口", text, re.I))
+    if is_search_entry or is_patent_discovery_entry:
         tier = "T3"
-        channel = "搜索入口/线索集合"
-        use_policy = "只能作为继续检索入口，不能直接作为事实证据。"
-    elif host.endswith((".gov", ".edu")) or ".gov." in host or any(token in host for token in ["sec.gov", "sse.com.cn", "szse.cn", "hkexnews.hk", "cninfo.com.cn", "patents.google.com", "uspto.gov", "wipo.int"]):
+        if is_patent_report_source:
+            channel = "专利报告库入口/线索集合"
+            use_policy = "只能作为继续检索专利报告、专利地图或原始专利的入口，不能直接作为事实证据。"
+        else:
+            channel = "搜索入口/线索集合"
+            use_policy = "只能作为继续检索入口，不能直接作为事实证据。"
+    elif is_patent_report_source:
+        tier = "T1"
+        channel = "专利报告/专利地图"
+        use_policy = "可用于识别技术路线、申请人布局、专利族、FTO 风险和空白点；具体权利要求必须回到原始专利文本核验。"
+    elif host.endswith((".gov", ".edu")) or ".gov." in host or any(token in host for token in ["sec.gov", "sse.com.cn", "szse.cn", "hkexnews.hk", "cninfo.com.cn", "patents.google.com", "uspto.gov", "wipo.int", "epo.org", "espacenet.com", "cnipa.gov.cn", "ggfw.cnipa.gov.cn", "cponline.cnipa.gov.cn"]):
         tier = "T0"
         channel = "一手/监管/专利/政府"
         use_policy = "可支撑事实、政策、披露、专利和时间线；市场结论仍需口径说明。"
@@ -960,14 +1000,16 @@ def source_profile(industry: str, title: str, url: str, snippet: str = "", relev
     elif "mp.weixin.qq.com" in host:
         tier = "T3"
         channel, use_policy = classify_wechat_quality(title, snippet)
-    depth_hits = len(re.findall(r"材料|工艺|专利|论文|良率|可靠性|阻抗|电极|界面|封装|客户认证|供应商|拆解|patent|paper|yield|reliability|electrode|interface|substrate|packaging|supplier|teardown|certification", text, re.I))
+    depth_hits = len(re.findall(r"材料|工艺|专利|专利报告|专利分析|专利布局|专利导航|专利地图|专利预警|专利族|申请趋势|主要申请人|技术功效矩阵|论文|良率|可靠性|阻抗|电极|界面|封装|客户认证|供应商|拆解|patent|patent landscape|patent report|patent analysis|patent insight|patent portfolio|patent family|freedom to operate|intellectual property|ip landscape|paper|yield|reliability|electrode|interface|substrate|packaging|supplier|teardown|certification", text, re.I))
     recency_hits = len(re.findall(r"2026|2025|最新|recent|latest|announces|launches|published|pubdate", text, re.I))
     primary_bonus = {"T0": 18, "T1": 12, "T2": 6, "T3": 1}.get(tier, 0)
     evidence_density = relevance_score * 2 + authority * 3 + primary_bonus + min(depth_hits, 8) * 3 + min(recency_hits, 4) * 2
     if "mp.weixin.qq.com" in host:
         evidence_density += wechat_quality_bonus(title, snippet) * 2
-    if is_search_entry:
+    if is_search_entry or is_patent_discovery_entry:
         evidence_density -= 8
+        if is_patent_report_source:
+            evidence_density = min(evidence_density, 34)
     if is_low_value_domain(host):
         evidence_density -= 20
 
@@ -1043,8 +1085,10 @@ def source_authority_score(url: str) -> int:
         score += 6
     if any(token in host for token in ["ieee.org", "nature.com", "science.org", "springer.com", "spiedigitallibrary.org", "arxiv.org"]):
         score += 5
-    if any(token in host for token in ["patents.google.com", "uspto.gov", "wipo.int"]):
+    if any(token in host for token in ["patents.google.com", "uspto.gov", "wipo.int", "epo.org", "espacenet.com", "cnipa.gov.cn", "ggfw.cnipa.gov.cn", "cponline.cnipa.gov.cn", "lens.org"]):
         score += 5
+    if any(token in host for token in ["patentcloud.com", "patsnap.com", "incopat.com"]):
+        score += 3
     if any(token in host for token in ["about.meta.com", "tech.facebook.com", "ai.meta.com", "tsmc.com", "intel.com", "samsung.com", "corning.com"]):
         score += 4
     if any(token in host for token in ["yolegroup.com", "lightcounting.com", "omdia.com", "idc.com", "gartner.com", "marketsandmarkets.com"]):
@@ -1061,14 +1105,18 @@ def classify_source_type(url: str) -> str:
     path = urlparse(url).path.lower()
     if "mp.weixin.qq.com" in host:
         return "C/T3 微信公众号线索，需按调研纪要/机构转述/普通观点继续分层并交叉验证"
+    if any(token in host + path for token in ["patent-landscape", "patent_landscape", "patent-report", "patent_report", "patent-insight", "patent_analysis", "patent-analysis", "专利报告", "专利导航", "专利地图"]):
+        return "A 专利报告/专利地图，适合发现技术路线与专利布局，权利要求需回查原文"
     if host.endswith((".gov", ".edu")) or ".gov." in host:
         return "S 政府/监管/高校"
     if any(token in host for token in ["sec.gov", "sse.com.cn", "szse.cn", "hkexnews.hk", "cninfo.com.cn"]):
         return "S 监管公告/交易所披露"
     if any(token in host for token in ["ieee.org", "nature.com", "science.org", "springer.com", "spiedigitallibrary.org", "arxiv.org"]):
         return "S 论文/学术资料"
-    if any(token in host for token in ["patents.google.com", "uspto.gov", "wipo.int"]):
+    if any(token in host for token in ["patents.google.com", "uspto.gov", "wipo.int", "epo.org", "espacenet.com", "cnipa.gov.cn", "ggfw.cnipa.gov.cn", "cponline.cnipa.gov.cn", "lens.org"]):
         return "S 专利/知识产权"
+    if any(token in host for token in ["patentcloud.com", "patsnap.com", "incopat.com"]):
+        return "A 专利数据库/知识产权分析"
     if any(token in host for token in ["investor", "annualreports.com"]) or any(token in path for token in ["annual", "10-k", "investor", "presentation"]):
         return "S/A 公司披露"
     if any(token in host for token in ["yolegroup.com", "lightcounting.com", "omdia.com", "idc.com", "gartner.com", "marketsandmarkets.com", "grandviewresearch.com", "imarcgroup.com"]):
@@ -1080,7 +1128,24 @@ def classify_source_type(url: str) -> str:
 
 def curated_source_candidates(industry: str) -> list[dict[str, str]]:
     lowered = industry.lower()
-    sources: list[dict[str, str]] = []
+    english_query = quote(" ".join(industry_search_aliases(industry)[:3]))
+    sources: list[dict[str, str]] = [
+        {
+            "title": f"WIPO Patent Landscape Reports - {industry}",
+            "url": "https://www.wipo.int/publications/en/series/index.jsp?id=93",
+            "snippet": f"Official WIPO patent landscape report series entry; search within it for {industry} / {english_query} to find patent landscape reports, applicant patterns, technology routes and IP white spaces.",
+        },
+        {
+            "title": f"EPO Patent Insight Reports - {industry}",
+            "url": "https://www.epo.org/en/searching-for-patents/business/patent-insight-reports",
+            "snippet": f"European Patent Office patent insight report entry; search within it for {industry} / {english_query} and verify technology trend claims against patent families.",
+        },
+        {
+            "title": f"Google Patents - {industry} patent landscape and FTO",
+            "url": f"https://patents.google.com/?q={english_query}%20patent%20landscape%20OR%20FTO%20OR%20patent%20portfolio",
+            "snippet": "Google Patents entry for original patents and patent families; verify claims and applicants behind patent landscape conclusions.",
+        },
+    ]
     if any(term in industry for term in ["肌电", "肌電", "手环", "手環", "神经腕带", "腕带"]) or any(term in lowered for term in ["emg", "electromyography", "neural wristband"]):
         sources.extend([
             {
@@ -1291,7 +1356,7 @@ def google_news_rss_search(query: str) -> list[dict[str, str]]:
 
 
 def query_needs_academic_search(query: str) -> bool:
-    return bool(re.search(r"论文|专利|材料|工艺|良率|可靠性|review|paper|patent|material|process|yield|reliability|electrode|substrate|IEEE|Nature|SPIE|OFC", query, re.I))
+    return bool(re.search(r"论文|专利|专利报告|专利导航|专利地图|专利预警|知识产权|专利族|材料|工艺|良率|可靠性|review|paper|patent|patent landscape|patent insight|patent portfolio|freedom to operate|\bfto\b|intellectual property|material|process|yield|reliability|electrode|substrate|IEEE|Nature|SPIE|OFC", query, re.I))
 
 
 def query_needs_open_source_search(query: str) -> bool:
