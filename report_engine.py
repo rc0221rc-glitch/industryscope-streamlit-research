@@ -19,6 +19,8 @@ from bs4 import BeautifulSoup
 from jinja2 import Template
 from openai import OpenAI
 
+from knowledge_base import kb_results_to_sources, search_knowledge_base
+
 try:
     import trafilatura
 except ImportError:  # Optional: keep the app usable before requirements are installed.
@@ -164,6 +166,9 @@ SECTION_TASKS = """
 ## 研究计划与检索策略
 先输出一张研究计划表：研究问题、需要的证据类型、优先来源、检索关键词、若找不到证据如何降级结论。关键词必须覆盖中英文、公司公告、年报/招股书、投资者材料、融资数据库/新闻、政策/监管、专利、论文/会议、市场数据、招聘、客户导入、产线/扩产、反证/失败案例。
 
+## 知识库与公开信息证据对比
+如果工具提供了专属知识库片段，必须输出表格：关键问题、知识库证据质量、公开信息证据质量、冲突点、采用策略、置信度。采用策略只能是“知识库为主/公开信息为主/双源交叉/证据不足”，并说明原因；不得机械优先知识库或公开网页。
+
 ## 执行摘要
 输出 6-8 条结论，每条必须包含：一句话判断、2-3 个可点击证据、置信度、最大反证/失败条件、未来 6-18 个月要跟踪的信号。禁止没有证据的口号式结论。
 
@@ -235,6 +240,7 @@ REPORT_OUTLINE = """
 ## 研究边界与多立场框架
 ## 本报告要回答的核心问题
 ## 研究计划与检索策略
+## 知识库与公开信息证据对比
 ## 执行摘要
 ## 深信号与隐藏拐点
 ## 最新动作与信息时效
@@ -456,6 +462,9 @@ class ReportRequest:
     timeout_seconds: int = 900
     max_local_sources: int = 8
     prefer_wechat: bool = True
+    use_knowledge_base: bool = True
+    knowledge_mode: str = "自动判断"
+    kb_top_k: int = 12
 
     @property
     def stance(self) -> str:
@@ -546,6 +555,9 @@ def call_openai(req: ReportRequest, api_key: str) -> tuple[str, list[dict[str, s
         "reasoning": {"effort": depth["reasoning_effort"]},
         "input": build_prompt(req),
     }
+    kb_context, kb_sources = build_knowledge_base_context(req)
+    if kb_context:
+        params["input"] += evidence_context_instruction(req, "", kb_context)
     if req.live_web:
         params.update(
             {
@@ -566,7 +578,7 @@ def call_openai(req: ReportRequest, api_key: str) -> tuple[str, list[dict[str, s
         response = client.responses.create(**params)
     text = getattr(response, "output_text", "") or ""
     data = response.model_dump() if hasattr(response, "model_dump") else json.loads(response.model_dump_json())
-    sources = collect_sources(data)
+    sources = kb_sources + collect_sources(data)
     return text, sources, data
 
 
@@ -1722,6 +1734,8 @@ def extract_with_beautifulsoup(html_text: str) -> tuple[str, str]:
 
 
 def fetch_source_text_with_method(url: str, timeout: int = 15) -> tuple[str, str]:
+    if url.startswith("kb://"):
+        return "", "knowledge base source; text provided by chunk metadata"
     if url.lower().split("?")[0].endswith((".pdf", ".xlsx", ".xls", ".docx", ".pptx")):
         return "", "binary document skipped"
     response = requests.get(
@@ -1766,15 +1780,19 @@ def source_snapshot_text(source: dict[str, str], idx: int, industry: str = "", p
     snippet = source.get("snippet", "")
     extraction_method = "not fetched"
     body = ""
-    try:
-        body, extraction_method = fetch_source_text_with_method(url, timeout=18)
-        body = body[:per_source_chars]
-        if industry and body and source_relevance_score(industry, title, url, body) < 2:
-            extraction_method += "; relevance guard triggered"
-            body = "抓取到的正文与研究行业关键词匹配度较低，已作为低置信度快照保留。请打开原始链接人工核验。"
-    except Exception as exc:
-        extraction_method = f"fetch failed: {type(exc).__name__}: {exc}"
-        body = ""
+    if url.startswith("kb://"):
+        extraction_method = "knowledge base chunk"
+        body = snippet[:per_source_chars]
+    else:
+        try:
+            body, extraction_method = fetch_source_text_with_method(url, timeout=18)
+            body = body[:per_source_chars]
+            if industry and body and source_relevance_score(industry, title, url, body) < 2:
+                extraction_method += "; relevance guard triggered"
+                body = "抓取到的正文与研究行业关键词匹配度较低，已作为低置信度快照保留。请打开原始链接人工核验。"
+        except Exception as exc:
+            extraction_method = f"fetch failed: {type(exc).__name__}: {exc}"
+            body = ""
 
     if not body:
         body = snippet or "未能抽取可读正文；本快照仅保留来源元数据、检索摘要和抓取状态。"
@@ -1924,7 +1942,7 @@ def build_source_pdf_package(sources: list[dict[str, str]], req: ReportRequest |
             except Exception as exc:
                 archive.writestr(txt_name, (snapshot + f"\n\nPDF 生成失败: {exc}").encode("utf-8"))
                 snapshot_file = txt_name
-            if url.lower().split("?")[0].endswith(".pdf"):
+            if url.startswith("http") and url.lower().split("?")[0].endswith(".pdf"):
                 try:
                     response = requests.get(
                         url,
@@ -1979,6 +1997,74 @@ def build_source_context(sources: list[dict[str, str]], industry: str = "", per_
     return tier_summary + "\n---\n" + "\n---\n".join(blocks)
 
 
+def build_knowledge_base_context(req: ReportRequest, per_chunk_chars: int = 1800) -> tuple[str, list[dict[str, str]]]:
+    if not req.use_knowledge_base or req.kb_top_k <= 0:
+        return "", []
+    query_parts = [
+        req.industry,
+        req.focus_questions,
+        "国内外厂商 技术路线 最新进展 融资 客户 产线 专利",
+        "行业拐点 商业化 先决条件 供应链成熟度 上游成熟度",
+    ]
+    results = search_knowledge_base("\n".join(part for part in query_parts if part), top_k=req.kb_top_k)
+    sources = kb_results_to_sources(results)
+    if not results:
+        return "", []
+    blocks = [
+        "专属知识库检索摘要：",
+        f"- 使用模式：{req.knowledge_mode}",
+        f"- 命中文档片段：{len(results)}",
+        "- 使用原则：知识库材料可作为深度资料和私有调研证据；若与公开一手来源冲突，必须比较发布时间、来源类型、口径和证据强度，不得机械优先任一渠道。",
+    ]
+    for idx, item in enumerate(results, start=1):
+        page = f"p.{item.get('page')}" if item.get("page") else item.get("section", "")
+        citation = f"[KB{idx} {item.get('title')}{(' ' + page) if page else ''}](kb://{item.get('chunk_id')})"
+        blocks.append(
+            "\n".join(
+                [
+                    f"[KB{idx}] {item.get('title')} {page}".strip(),
+                    f"内部引用: kb://{item.get('chunk_id')}",
+                    f"文件: {item.get('filename')}",
+                    f"来源类型/分层: {item.get('source_type')} / {item.get('source_tier')}",
+                    f"机构/日期: {item.get('source_org') or '未标注'} / {item.get('publish_date') or '未标注'}",
+                    f"标签: 行业={item.get('industry_tags') or '无'}；公司={item.get('company_tags') or '无'}；技术={item.get('technology_tags') or '无'}",
+                    f"匹配分数: {item.get('score')}；命中词: {item.get('matched_terms')}",
+                    f"必须使用的Markdown引用片段: {citation}",
+                    f"正文片段: {str(item.get('text', ''))[:per_chunk_chars]}",
+                ]
+            )
+        )
+    return "\n---\n".join(blocks), sources
+
+
+def evidence_context_instruction(req: ReportRequest, source_context: str, kb_context: str) -> str:
+    sections: list[str] = []
+    if kb_context:
+        sections.append(
+            f"""
+以下是工具从“专属文档知识库”检索出的证据片段。你必须把它与公开网页来源分开审计，并在报告中新增或填充“知识库与公开信息证据对比”内容：逐项判断哪些问题应以知识库为主、哪些应以公开信息为主、哪些需要双源交叉验证。知识库引用可使用 kb:// 内部链接，但涉及重大事实、融资、客户订单、上市公司财务、政策和最新事件时，必须尽量寻找公开一手来源交叉验证。
+
+{kb_context}
+"""
+        )
+    if source_context:
+        sections.append(
+            f"""
+以下是工具预先检索和抓取的公开来源。第一步必须做来源相关性审查：若来源与「{req.industry}」无关、是电商/歌词/视频/地图/登录页/论坛噪声，必须在引用审计中列为“剔除来源”，正文不得引用其事实。请优先使用相关来源，并在正文中使用这些 URL 做可点击引用。若某个重要结论无法由来源支持，必须标注“证据不足/低置信度”，但不要因为部分来源无效而终止全文；应输出“证据受限版研报”，把强结论降级为待核验假设。
+微信公众号优先规则：若来源中包含 mp.weixin.qq.com，必须先看信息源渠道字段。高价值公众号线索（调研纪要、专家访谈、电话会、产业链纪要、海外投行/研究机构翻译摘译、SemiAnalysis/Bernstein 等）可优先用于发现深层变量和争议点；普通观点号只作背景；营销/荐股/课程号应剔除或降权。所有市场规模、份额、融资估值、客户订单、财务、全球第一/独家/垄断等强结论必须由公告、年报、政策原文、论文、权威数据机构或主流财经媒体交叉验证。
+硬性要求：执行摘要每条尽量使用 2 个 Markdown 链接；每个关键表格的“来源”列必须使用 Markdown 链接、kb:// 内部知识库引用或写“证据不足”；引用审计表的 URL 列必须使用 Markdown 链接或 kb:// 内部引用。
+
+{source_context}
+"""
+        )
+    if sections:
+        return "\n".join(sections)
+    return """
+
+本次没有成功抓取到外部来源或知识库证据。请不要编造 URL；请输出“证据受限版研报”，只能基于用户指定来源和你明确知道的稳定事实写作，所有关键数字、融资、份额、客户绑定关系必须显著标注“证据不足/待核验”，不得全文终止。
+"""
+
+
 def source_tier_summary(sources: list[dict[str, str]]) -> str:
     if not sources:
         return "来源分层摘要：无自动检索来源。"
@@ -2003,8 +2089,10 @@ def source_tier_summary(sources: list[dict[str, str]]) -> str:
 def call_chat_compatible(req: ReportRequest, api_key: str) -> tuple[str, list[dict[str, str]], dict[str, Any]]:
     default_sources = {"快速版": 8, "标准版": 16, "深度版": 24}.get(req.depth, 16)
     max_sources = min(req.max_local_sources, default_sources)
-    sources = search_public_web(req, max_sources)
-    source_context = build_source_context(sources, req.industry)
+    public_sources = search_public_web(req, max_sources)
+    source_context = build_source_context(public_sources, req.industry)
+    kb_context, kb_sources = build_knowledge_base_context(req)
+    sources = kb_sources + public_sources
     client = OpenAI(
         api_key=api_key,
         base_url=req.base_url or None,
@@ -2013,20 +2101,7 @@ def call_chat_compatible(req: ReportRequest, api_key: str) -> tuple[str, list[di
     )
     depth = DEPTH_CONFIG.get(req.depth, DEPTH_CONFIG["标准版"])
     prompt = build_prompt(req)
-    if source_context:
-        prompt += f"""
-
-以下是工具预先检索和抓取的公开来源。第一步必须做来源相关性审查：若来源与「{req.industry}」无关、是电商/歌词/视频/地图/登录页/论坛噪声，必须在引用审计中列为“剔除来源”，正文不得引用其事实。请优先使用相关来源，并在正文中使用这些 URL 做可点击引用。若某个重要结论无法由来源支持，必须标注“证据不足/低置信度”，但不要因为部分来源无效而终止全文；应输出“证据受限版研报”，把强结论降级为待核验假设。
-微信公众号优先规则：若来源中包含 mp.weixin.qq.com，必须先看信息源渠道字段。高价值公众号线索（调研纪要、专家访谈、电话会、产业链纪要、海外投行/研究机构翻译摘译、SemiAnalysis/Bernstein 等）可优先用于发现深层变量和争议点；普通观点号只作背景；营销/荐股/课程号应剔除或降权。所有市场规模、份额、融资估值、客户订单、财务、全球第一/独家/垄断等强结论必须由公告、年报、政策原文、论文、权威数据机构或主流财经媒体交叉验证。
-硬性要求：执行摘要每条尽量使用 2 个 Markdown 链接；每个关键表格的“来源”列必须使用 Markdown 链接或写“证据不足”；引用审计表的 URL 列必须使用 Markdown 链接。
-
-{source_context}
-"""
-    else:
-        prompt += """
-
-本次没有成功抓取到外部来源。请不要编造 URL；请输出“证据受限版研报”，只能基于用户指定来源和你明确知道的稳定事实写作，所有关键数字、融资、份额、客户绑定关系必须显著标注“证据不足/待核验”，不得全文终止。
-"""
+    prompt += evidence_context_instruction(req, source_context, kb_context)
 
     messages = [
         {"role": "system", "content": "你是严谨的行业研究员。只输出可交付 Markdown 研报，不要输出闲聊或代码块。"},
@@ -2116,23 +2191,12 @@ def post_anthropic_message(
 def build_chat_source_prompt(req: ReportRequest) -> tuple[str, list[dict[str, str]]]:
     default_sources = {"快速版": 8, "标准版": 16, "深度版": 24}.get(req.depth, 16)
     max_sources = min(req.max_local_sources, default_sources)
-    sources = search_public_web(req, max_sources)
-    source_context = build_source_context(sources, req.industry)
+    public_sources = search_public_web(req, max_sources)
+    source_context = build_source_context(public_sources, req.industry)
+    kb_context, kb_sources = build_knowledge_base_context(req)
+    sources = kb_sources + public_sources
     prompt = build_prompt(req)
-    if source_context:
-        prompt += f"""
-
-以下是工具预先检索和抓取的公开来源。第一步必须做来源相关性审查：若来源与「{req.industry}」无关、是电商/歌词/视频/地图/登录页/论坛噪声，必须在引用审计中列为“剔除来源”，正文不得引用其事实。请优先使用相关来源，并在正文中使用这些 URL 做可点击引用。若某个重要结论无法由来源支持，必须标注“证据不足/低置信度”，但不要因为部分来源无效而终止全文；应输出“证据受限版研报”，把强结论降级为待核验假设。
-微信公众号优先规则：若来源中包含 mp.weixin.qq.com，必须先看信息源渠道字段。高价值公众号线索（调研纪要、专家访谈、电话会、产业链纪要、海外投行/研究机构翻译摘译、SemiAnalysis/Bernstein 等）可优先用于发现深层变量和争议点；普通观点号只作背景；营销/荐股/课程号应剔除或降权。所有市场规模、份额、融资估值、客户订单、财务、全球第一/独家/垄断等强结论必须由公告、年报、政策原文、论文、权威数据机构或主流财经媒体交叉验证。
-硬性要求：执行摘要每条尽量使用 2 个 Markdown 链接；每个关键表格的“来源”列必须使用 Markdown 链接或写“证据不足”；引用审计表的 URL 列必须使用 Markdown 链接。
-
-{source_context}
-"""
-    else:
-        prompt += """
-
-本次没有成功抓取到外部来源。请不要编造 URL；请输出“证据受限版研报”，只能基于用户指定来源和你明确知道的稳定事实写作，所有关键数字、融资、份额、客户绑定关系必须显著标注“证据不足/待核验”，不得全文终止。
-"""
+    prompt += evidence_context_instruction(req, source_context, kb_context)
     return prompt, sources
 
 
@@ -2247,7 +2311,8 @@ def render_markdown_to_html(markdown_text: str) -> str:
         extensions=["tables", "fenced_code", "toc", "sane_lists", "nl2br"],
         output_format="html5",
     )
-    return re.sub(r'<a href="(https?://[^"]+)"', r'<a href="\1" target="_blank" rel="noopener noreferrer"', rendered)
+    rendered = re.sub(r'<a href="(https?://[^"]+)"', r'<a href="\1" target="_blank" rel="noopener noreferrer"', rendered)
+    return re.sub(r'<a href="(kb://[^"]+)"', r'<a href="\1" class="kb-link"', rendered)
 
 
 def ensure_clickable_source_section(markdown_text: str, sources: list[dict[str, str]] | None = None) -> str:
@@ -2265,13 +2330,14 @@ def ensure_clickable_source_section(markdown_text: str, sources: list[dict[str, 
     for idx, source in enumerate(sources, start=1):
         title = source.get("title") or f"Source {idx}"
         url = source.get("url", "")
-        if url.startswith(("http://", "https://")):
+        if url.startswith(("http://", "https://", "kb://")):
             lines.append(f"- S{idx}: [{title}]({url})")
     return markdown_text.rstrip() + "\n" + "\n".join(lines)
 
 
 def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = None) -> dict[str, Any]:
-    links = re.findall(r"\[[^\]]+\]\(https?://[^)]+\)", markdown_text)
+    links = re.findall(r"\[[^\]]+\]\((?:https?://|kb://)[^)]+\)", markdown_text)
+    kb_links = re.findall(r"\[[^\]]+\]\(kb://[^)]+\)", markdown_text)
     non_clickable_refs = re.findall(r"\[[0-9一二三四五六七八九十]+[.\-、][^\]]+\]", markdown_text)
     headings = re.findall(r"^#{2,3}\s+", markdown_text, flags=re.MULTILINE)
     has_audit = "引用审计表" in markdown_text and ("证据强度" in markdown_text or "Source ID" in markdown_text)
@@ -2285,6 +2351,7 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
     has_recency_section = any(term in markdown_text for term in ["最新动作", "信息时效", "最近 180 天", "最近180天", "最近 90 天", "最近90天", "最近 30 天", "最近30天"])
     has_source_tiering = any(term in markdown_text for term in ["信息源渠道分层", "信息源分层", "信息浓度", "T0", "T1", "T2", "T3"])
     has_rejected_sources = any(term in markdown_text for term in ["剔除来源", "低相关来源", "来源相关性审查"])
+    has_kb_public_compare = "知识库与公开信息证据对比" in markdown_text or ("知识库" in markdown_text and "公开信息" in markdown_text and "采用策略" in markdown_text)
     has_company_deep_compare = (
         any(term in markdown_text for term in ["厂商深度比较", "全球重点厂商", "中国重点厂商", "厂商雷达"])
         and any(term in markdown_text for term in ["竞争优势", "短板", "技术路线", "客户", "融资", "产线", "量产"])
@@ -2341,12 +2408,15 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
         warnings.append("未检测到拐点时间表与先决条件闸门，需覆盖商业、技术、供应链/上游成熟度和失败信号。")
     if not has_source_tiering:
         warnings.append("未检测到信息源渠道分层复盘，建议说明 T0/T1/T2/T3 来源如何支撑结论。")
+    if any(source.get("type") == "knowledge_base" or str(source.get("url", "")).startswith("kb://") for source in (sources or [])) and not has_kb_public_compare:
+        warnings.append("已命中专属知识库，但未检测到知识库与公开信息证据对比。")
     if sources and not has_rejected_sources:
         warnings.append("未检测到来源相关性审查或剔除来源说明。")
     if len(evidence_hygiene_hits) < 3:
         warnings.append("证据卫生不足：建议补充口径、分母、单一来源/证据不足说明。")
     return {
         "links": len(links),
+        "kb_links": len(kb_links),
         "non_clickable_refs": len(non_clickable_refs),
         "headings": len(headings),
         "api_sources": len(sources or []),
@@ -2361,6 +2431,7 @@ def report_quality(markdown_text: str, sources: list[dict[str, str]] | None = No
         "has_recency_section": has_recency_section,
         "has_source_tiering": has_source_tiering,
         "has_rejected_sources": has_rejected_sources,
+        "has_kb_public_compare": has_kb_public_compare,
         "has_company_deep_compare": has_company_deep_compare,
         "has_company_progress_map": has_company_progress_map,
         "has_inflection_gate": has_inflection_gate,

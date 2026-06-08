@@ -5,6 +5,6 @@ venv/
 .env
 .streamlit/secrets.toml
 work/
+data/knowledge_base/
 *.log
 *.tmp
-

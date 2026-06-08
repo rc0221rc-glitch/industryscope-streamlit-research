@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from datetime import datetime
+from pathlib import Path
 
 import streamlit as st
 
@@ -19,6 +21,16 @@ from report_engine import (
     sample_report,
 )
 from openai import APITimeoutError
+
+from knowledge_base import (
+    SOURCE_TYPE_TIERS,
+    add_document,
+    delete_document,
+    export_kb_json,
+    kb_stats,
+    load_documents,
+    search_knowledge_base,
+)
 
 
 st.set_page_config(
@@ -148,6 +160,24 @@ def sidebar_request() -> tuple[ReportRequest, str, bool]:
             key=f"local_sources_{provider}_{depth or '标准版'}",
             help="仅 DeepSeek / Anthropic / OpenAI兼容模式使用。工具会先扩展多渠道候选池，再按 T0/T1/T2/T3 和信息浓度筛选这些高价值来源；设为 0 可跳过自动搜索。",
         )
+        st.divider()
+        st.header("专属知识库")
+        knowledge_mode = st.selectbox(
+            "知识库使用模式",
+            ["自动判断", "优先知识库", "优先公开信息", "只用知识库", "不使用知识库"],
+            index=0,
+            help="自动判断：同时检索知识库和公开信息，并要求模型比较证据质量；只用知识库会关闭实时网页访问。",
+        )
+        kb_top_k = st.slider(
+            "知识库片段数",
+            min_value=0,
+            max_value=30,
+            value=12,
+            step=1,
+            help="生成报告前从专属文档知识库召回的片段数。",
+        )
+        if knowledge_mode == "只用知识库":
+            live_web = False
 
         st.divider()
         st.header("关注与来源")
@@ -205,6 +235,9 @@ def sidebar_request() -> tuple[ReportRequest, str, bool]:
         timeout_seconds=timeout_seconds,
         max_local_sources=max_local_sources,
         prefer_wechat=prefer_wechat,
+        use_knowledge_base=knowledge_mode != "不使用知识库" and kb_top_k > 0,
+        knowledge_mode=knowledge_mode,
+        kb_top_k=kb_top_k,
     )
     return request, manual_key, demo_mode
 
@@ -347,6 +380,121 @@ def render_result() -> None:
             st.text_area("生成提示词", value=build_prompt(req), height=720)
 
 
+def render_knowledge_base() -> None:
+    st.subheader("专属文档知识库")
+    stats = kb_stats()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("文档数", stats["documents"])
+    c2.metric("片段数", stats["chunks"])
+    c3.metric("存储目录", stats["root"])
+
+    with st.expander("上传并入库", expanded=True):
+        uploaded = st.file_uploader(
+            "上传文档",
+            type=["pdf", "docx", "md", "txt", "html", "htm", "xlsx", "xls", "csv"],
+            accept_multiple_files=True,
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            source_type = st.selectbox("来源类型", list(SOURCE_TYPE_TIERS.keys()), index=list(SOURCE_TYPE_TIERS.keys()).index("券商/投行/咨询研报"))
+            source_org = st.text_input("来源机构", placeholder="例如：SemiAnalysis、Bernstein、某券商、公司名")
+            publish_date = st.text_input("发布日期", placeholder="例如：2026-05-12 或 2026Q1")
+        with col_b:
+            industry_tags = st.text_input("行业标签", placeholder="例如：硅光芯片, CPO, 肌电手环")
+            company_tags = st.text_input("公司标签", placeholder="例如：Meta, TSMC, Intel")
+            technology_tags = st.text_input("技术标签", placeholder="例如：DLC电极, TGV, glass substrate")
+        title_prefix = st.text_input("标题前缀（可选）", placeholder="留空则使用文件名")
+        if st.button("入库上传文档", type="primary", use_container_width=True):
+            if not uploaded:
+                st.error("请先选择文件。")
+            else:
+                ok = 0
+                errors: list[str] = []
+                for file in uploaded:
+                    suffix = Path(file.name).suffix
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                        tmp.write(file.getbuffer())
+                        tmp_path = Path(tmp.name)
+                    try:
+                        title = f"{title_prefix.strip()} {Path(file.name).stem}".strip() if title_prefix.strip() else Path(file.name).stem
+                        doc = add_document(
+                            tmp_path,
+                            title=title,
+                            source_type=source_type,
+                            source_org=source_org,
+                            publish_date=publish_date,
+                            industry_tags=industry_tags,
+                            company_tags=company_tags,
+                            technology_tags=technology_tags,
+                        )
+                        ok += 1
+                        st.toast(f"已入库：{doc.title}（{doc.chunk_count} 个片段）")
+                    except Exception as exc:
+                        errors.append(f"{file.name}: {exc}")
+                    finally:
+                        tmp_path.unlink(missing_ok=True)
+                if ok:
+                    st.success(f"成功入库 {ok} 个文档。")
+                if errors:
+                    st.error("\n".join(errors))
+
+    docs = load_documents()
+    st.subheader("已入库文档")
+    if docs:
+        rows = []
+        for doc in docs.values():
+            rows.append({
+                "doc_id": doc.get("doc_id"),
+                "标题": doc.get("title"),
+                "类型": doc.get("source_type"),
+                "分层": doc.get("source_tier"),
+                "机构": doc.get("source_org"),
+                "日期": doc.get("publish_date"),
+                "片段": doc.get("chunk_count"),
+                "行业标签": doc.get("industry_tags"),
+                "公司标签": doc.get("company_tags"),
+                "技术标签": doc.get("technology_tags"),
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        delete_id = st.text_input("删除文档 doc_id", placeholder="粘贴上表 doc_id 后点击删除")
+        if st.button("删除该文档", use_container_width=True):
+            if delete_id.strip():
+                delete_document(delete_id.strip())
+                st.success("已删除。")
+            else:
+                st.error("请填写 doc_id。")
+        st.download_button(
+            "导出知识库索引 JSON",
+            data=export_kb_json().encode("utf-8"),
+            file_name=f"industryscope_kb_export_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    else:
+        st.info("还没有入库文档。")
+
+    st.subheader("检索测试")
+    query = st.text_input("测试查询", value="肌电手环 DLC 电极 材料 Meta")
+    top_k = st.slider("返回片段数", 1, 20, 8, key="kb_test_top_k")
+    if st.button("检索知识库", use_container_width=True):
+        results = search_knowledge_base(query, top_k=top_k)
+        if not results:
+            st.warning("没有命中。可以尝试增加行业/公司/技术标签，或换一组关键词。")
+        for idx, item in enumerate(results, start=1):
+            with st.expander(f"KB{idx}｜{item.get('title')}｜分数 {item.get('score')}｜{item.get('filename')}"):
+                st.write({
+                    "chunk_id": item.get("chunk_id"),
+                    "source_type": item.get("source_type"),
+                    "source_tier": item.get("source_tier"),
+                    "source_org": item.get("source_org"),
+                    "publish_date": item.get("publish_date"),
+                    "page": item.get("page"),
+                    "section": item.get("section"),
+                    "matched_terms": item.get("matched_terms"),
+                })
+                st.text_area("片段", value=item.get("text", ""), height=220, key=f"kb_chunk_{item.get('chunk_id')}")
+
+
 def main() -> None:
     ensure_state()
     req, manual_key, demo_mode = sidebar_request()
@@ -355,23 +503,27 @@ def main() -> None:
     caption_suffix = st.secrets.get("CAPTION_SUFFIX", os.getenv("CAPTION_SUFFIX", ""))
     st.caption(f"输入行业，生成带可点击引用、引用审计、HTML 下载和来源 PDF 证据包的深度研究报告。{caption_suffix}")
 
-    left, right = st.columns([1, 1])
-    with left:
-        generate_clicked = st.button("生成深度研报", type="primary", use_container_width=True)
-    with right:
-        prompt = build_prompt(req)
-        st.download_button(
-            "下载当前提示词",
-            data=prompt.encode("utf-8"),
-            file_name=f"{filename_safe(req.industry or 'industry')}_prompt.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
+    tab_generate, tab_kb = st.tabs(["生成研报", "知识库"])
+    with tab_generate:
+        left, right = st.columns([1, 1])
+        with left:
+            generate_clicked = st.button("生成深度研报", type="primary", use_container_width=True)
+        with right:
+            prompt = build_prompt(req)
+            st.download_button(
+                "下载当前提示词",
+                data=prompt.encode("utf-8"),
+                file_name=f"{filename_safe(req.industry or 'industry')}_prompt.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
 
-    if generate_clicked:
-        generate(req, manual_key, demo_mode)
+        if generate_clicked:
+            generate(req, manual_key, demo_mode)
 
-    render_result()
+        render_result()
+    with tab_kb:
+        render_knowledge_base()
 
 
 if __name__ == "__main__":
