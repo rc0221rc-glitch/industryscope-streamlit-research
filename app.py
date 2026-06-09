@@ -47,6 +47,7 @@ from wechat_ingest import (
     fetch_wechat_article,
     ingest_wechat_article,
     ingest_wechat_candidate_stub,
+    ingest_wechat_fulltext,
     resolve_sogou_search_url,
     search_sogou_wechat,
 )
@@ -697,7 +698,7 @@ def render_knowledge_base() -> None:
                         st.error("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
 
     with st.expander("微信公众号自动补新", expanded=False):
-        st.caption("通过搜狗微信搜索发现公开公众号文章，抓取可访问正文并生成 Markdown 文档入库。遇到验证码、过期链接或微信环境校验时会跳过并提示。")
+        st.caption("通过搜狗微信搜索发现公众号文章；能抓到正文的会作为全文证据入库，遇到验证码/环境校验时只入库为候选线索，需人工补全文后才能作为报告证据。")
         col_w1, col_w2, col_w3 = st.columns([2, 1, 1])
         with col_w1:
             wechat_keyword = st.text_input("搜索关键词", value="", placeholder="例如：肌电手环 DLC 电极；玻璃基板封装 台积电 TGV")
@@ -718,6 +719,40 @@ def render_knowledge_base() -> None:
             placeholder="每行一个 mp.weixin.qq.com 链接。用于搜狗跳转触发验证码时的稳定备用入口。",
             height=68,
         )
+        st.markdown("#### 手动粘贴公众号全文入库")
+        st.caption("如果搜狗或微信触发图片验证，请在浏览器里人工打开文章并复制正文。这里粘贴的全文会作为真正的知识库证据；只保存候选链接的条目不会支撑报告强结论。")
+        manual_full_title = st.text_input("文章标题", value="", key="manual_wechat_full_title")
+        col_full1, col_full2 = st.columns(2)
+        with col_full1:
+            manual_full_url = st.text_input("原文链接", value="", placeholder="https://mp.weixin.qq.com/s/...", key="manual_wechat_full_url")
+            manual_full_account = st.text_input("公众号/作者", value="", key="manual_wechat_full_account")
+        with col_full2:
+            manual_full_date = st.text_input("发布日期", value="", placeholder="YYYY-MM-DD，可留空", key="manual_wechat_full_date")
+            manual_full_keyword = st.text_input("归档关键词", value="", placeholder="默认使用上方搜索关键词或标题", key="manual_wechat_full_keyword")
+        manual_full_content = st.text_area(
+            "正文全文",
+            value="",
+            placeholder="粘贴文章正文主体。建议保留小标题、表格文字、来源说明和图片下方文字。",
+            height=240,
+            key="manual_wechat_full_content",
+        )
+        if st.button("入库手动粘贴的公众号全文", use_container_width=True):
+            try:
+                result = ingest_wechat_fulltext(
+                    title=manual_full_title.strip(),
+                    content=manual_full_content,
+                    url=manual_full_url.strip(),
+                    account=manual_full_account.strip(),
+                    published_at=manual_full_date.strip(),
+                    keyword=manual_full_keyword.strip() or wechat_keyword.strip() or manual_full_title.strip(),
+                    industry_tags=wechat_industry_tags.strip() or wechat_keyword.strip() or manual_full_title.strip(),
+                    company_tags=wechat_company_tags.strip(),
+                    technology_tags=wechat_technology_tags.strip(),
+                )
+                st.success(f"已入库公众号全文：{result['document'].get('title', manual_full_title or '未命名文章')}")
+                sync_kb_after_write()
+            except Exception as exc:
+                st.error(f"全文入库失败：{exc}")
 
         if st.button("搜索并入库最近公众号文章", type="primary", use_container_width=True):
             if not wechat_keyword.strip():
@@ -739,7 +774,7 @@ def render_knowledge_base() -> None:
                             technology_tags=wechat_technology_tags.strip(),
                         )
                         if ok:
-                            st.success(f"自动成功入库最近 {ok} 篇公众号文章。")
+                            st.success(f"已入库 {ok} 条公众号结果；其中抓取失败的条目会标记为候选线索，待人工补全文。")
                             sync_kb_after_write()
                         if errors:
                             st.error("\n".join(errors))
@@ -779,7 +814,7 @@ def render_knowledge_base() -> None:
                     technology_tags=wechat_technology_tags.strip(),
                 )
                 if ok:
-                    st.success(f"成功补充入库 {ok} 篇公众号文章。")
+                    st.success(f"成功补充入库 {ok} 条公众号结果；候选线索需人工补全文后才会作为报告证据。")
                     sync_kb_after_write()
                 if errors:
                     st.error("\n".join(errors))

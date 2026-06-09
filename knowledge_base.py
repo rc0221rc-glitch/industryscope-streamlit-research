@@ -61,8 +61,24 @@ SOURCE_TYPE_TIERS = {
     "行业白皮书/协会报告": "T1",
     "内部笔记": "T2",
     "公众号/媒体转载": "T3",
+    "微信公众号候选线索": "T3",
     "其他": "T2",
 }
+
+
+WECHAT_CANDIDATE_SOURCE_TYPE = "微信公众号候选线索"
+
+
+def is_wechat_candidate_stub_record(item: dict[str, Any]) -> bool:
+    source_type = str(item.get("source_type", ""))
+    title = str(item.get("title", ""))
+    text = str(item.get("text", "") or item.get("snippet", ""))
+    return (
+        source_type == WECHAT_CANDIDATE_SOURCE_TYPE
+        or "候选线索" in title
+        or "入库状态：候选线索" in text
+        or "未能自动抓取全文" in text
+    )
 
 
 @dataclass
@@ -598,6 +614,8 @@ def search_knowledge_base(query: str, top_k: int = 12, filters: dict[str, str] |
         title_bonus = 5.0 if any(term in str(chunk.get("title", "")).lower() for term in query_terms) else 0.0
         tag_bonus = 4.0 if any(term in f"{chunk.get('industry_tags', '')} {chunk.get('company_tags', '')} {chunk.get('technology_tags', '')}".lower() for term in query_terms) else 0.0
         score = coverage * 45 + math.log1p(dense_hits) * 10 + tier_score(str(chunk.get("source_tier", ""))) + date_score(str(chunk.get("publish_date", ""))) + phrase_bonus + title_bonus + tag_bonus
+        if is_wechat_candidate_stub_record(chunk):
+            score = max(1.0, score - 25.0)
         result = dict(chunk)
         result["score"] = round(score, 2)
         result["match_coverage"] = round(coverage, 2)
@@ -639,17 +657,25 @@ def kb_results_to_sources(results: list[dict[str, Any]]) -> list[dict[str, str]]
         title = item.get("title") or item.get("filename") or f"KB Source {idx}"
         label = f"{title} {page}".strip()
         chunk_id = item.get("chunk_id", "")
+        is_candidate_stub = is_wechat_candidate_stub_record(item)
+        source_channel = "微信公众号候选线索" if is_candidate_stub else "专属知识库"
+        use_policy = (
+            "仅可作为待补全文的发现线索；不得作为已读全文证据，不得支撑市场规模、份额、融资、订单、财务、客户绑定、技术指标或全球第一等强结论。"
+            if is_candidate_stub
+            else "可作为私有知识库证据；重大强结论仍需与一手公开来源或其他知识库文件交叉验证。"
+        )
         sources.append({
             "title": label,
             "url": f"kb://{chunk_id}",
             "snippet": str(item.get("text", ""))[:500],
             "type": "knowledge_base",
             "source_tier": item.get("source_tier", "T2"),
-            "source_channel": "专属知识库",
-            "density_band": "高" if float(item.get("score", 0)) >= 55 else "中",
+            "source_channel": source_channel,
+            "density_band": "候选线索" if is_candidate_stub else ("高" if float(item.get("score", 0)) >= 55 else "中"),
             "evidence_density": str(int(float(item.get("score", 0)))),
             "relevance": str(int(float(item.get("score", 0)) // 10)),
-            "use_policy": "可作为私有知识库证据；重大强结论仍需与一手公开来源或其他知识库文件交叉验证。",
+            "use_policy": use_policy,
+            "kb_is_candidate_stub": "true" if is_candidate_stub else "false",
             "kb_chunk_id": chunk_id,
             "kb_doc_id": item.get("doc_id", ""),
             "kb_filename": item.get("filename", ""),

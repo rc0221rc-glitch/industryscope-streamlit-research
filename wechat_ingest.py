@@ -13,7 +13,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from knowledge_base import add_document, filename_safe
+from knowledge_base import WECHAT_CANDIDATE_SOURCE_TYPE, add_document, filename_safe
 
 
 SOGOU_WECHAT_URL = "https://weixin.sogou.com/weixin"
@@ -264,7 +264,7 @@ def candidate_to_markdown(candidate: dict[str, Any], keyword: str, error: str = 
             "",
             "## 后续处理",
             "",
-            "如需全文证据，请手动打开搜狗候选链接或微信文章，复制 mp.weixin.qq.com 原文链接到“手动粘贴微信文章链接”入口重新入库。",
+            "如需全文证据，请手动打开搜狗候选链接或微信文章，通过验证码后复制标题、原文链接和正文到“手动粘贴公众号全文入库”入口。只粘贴链接仍可能被微信环境校验拦截。",
             "",
         ]
     )
@@ -288,7 +288,7 @@ def ingest_wechat_candidate_stub(
         doc = add_document(
             tmp_path,
             title=title,
-            source_type="公众号/媒体转载",
+            source_type=WECHAT_CANDIDATE_SOURCE_TYPE,
             source_org=candidate.get("account", ""),
             publish_date=candidate.get("published_at", ""),
             industry_tags=industry_tags or keyword,
@@ -299,6 +299,37 @@ def ingest_wechat_candidate_stub(
         return {"document": asdict(doc), "markdown": markdown_text}
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def ingest_wechat_fulltext(
+    title: str,
+    content: str,
+    url: str = "",
+    account: str = "",
+    published_at: str = "",
+    keyword: str = "",
+    industry_tags: str = "",
+    company_tags: str = "",
+    technology_tags: str = "",
+) -> dict[str, Any]:
+    cleaned_content = clean_text(content)
+    if len(cleaned_content) < 120:
+        raise RuntimeError("粘贴正文太短，无法作为全文证据入库。请至少粘贴正文主体内容。")
+    article = WechatArticle(
+        title=normalize_space(title) or "手动粘贴公众号全文",
+        url=normalize_space(url),
+        account=normalize_space(account),
+        published_at=normalize_space(published_at),
+        content=cleaned_content,
+    )
+    return ingest_wechat_article(
+        article,
+        keyword=keyword or title,
+        industry_tags=industry_tags or keyword or title,
+        company_tags=company_tags,
+        technology_tags=technology_tags,
+        search_rank=0,
+    )
 
 
 def ingest_wechat_article(

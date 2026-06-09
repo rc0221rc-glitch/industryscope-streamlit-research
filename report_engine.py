@@ -19,7 +19,7 @@ from bs4 import BeautifulSoup
 from jinja2 import Template
 from openai import OpenAI
 
-from knowledge_base import kb_results_to_sources, search_knowledge_base
+from knowledge_base import is_wechat_candidate_stub_record, kb_results_to_sources, search_knowledge_base
 
 try:
     import trafilatura
@@ -2055,10 +2055,19 @@ def build_knowledge_base_context(req: ReportRequest, per_chunk_chars: int = 1800
         f"- 使用模式：{req.knowledge_mode}",
         f"- 命中文档片段：{len(results)}",
         "- 使用原则：知识库材料可作为深度资料和私有调研证据；若与公开一手来源冲突，必须比较发布时间、来源类型、口径和证据强度，不得机械优先任一渠道。",
+        "- 微信公众号候选线索规则：凡来源类型为“微信公众号候选线索”、标题含“候选线索”或正文写明“未能自动抓取全文”的片段，只代表搜索发现过这篇文章；模型没有读到全文，不得引用它支撑事实结论，只能放入待核验清单或用于生成后续检索关键词。",
     ]
     for idx, item in enumerate(results, start=1):
         page = f"p.{item.get('page')}" if item.get("page") else item.get("section", "")
         citation = f"[KB{idx} {item.get('title')}{(' ' + page) if page else ''}](kb://{item.get('chunk_id')})"
+        is_candidate_stub = is_wechat_candidate_stub_record(item)
+        policy_line = (
+            "证据状态: 候选线索，未抓取全文。禁止作为事实证据；禁止支撑市场规模、份额、融资、订单、财务、客户绑定、技术指标、全球第一/独家/垄断等强结论；只能写入待核验线索、关键词或资料缺口。"
+            if is_candidate_stub
+            else "证据状态: 已抽取正文片段，可作为知识库证据；重大强结论仍需交叉验证。"
+        )
+        text_limit = 500 if is_candidate_stub else per_chunk_chars
+        citation_label = "仅待核验引用片段" if is_candidate_stub else "必须使用的Markdown引用片段"
         blocks.append(
             "\n".join(
                 [
@@ -2066,11 +2075,12 @@ def build_knowledge_base_context(req: ReportRequest, per_chunk_chars: int = 1800
                     f"内部引用: kb://{item.get('chunk_id')}",
                     f"文件: {item.get('filename')}",
                     f"来源类型/分层: {item.get('source_type')} / {item.get('source_tier')}",
+                    policy_line,
                     f"机构/日期: {item.get('source_org') or '未标注'} / {item.get('publish_date') or '未标注'}",
                     f"标签: 行业={item.get('industry_tags') or '无'}；公司={item.get('company_tags') or '无'}；技术={item.get('technology_tags') or '无'}",
                     f"匹配分数: {item.get('score')}；命中词: {item.get('matched_terms')}",
-                    f"必须使用的Markdown引用片段: {citation}",
-                    f"正文片段: {str(item.get('text', ''))[:per_chunk_chars]}",
+                    f"{citation_label}: {citation}",
+                    f"正文片段: {str(item.get('text', ''))[:text_limit]}",
                 ]
             )
         )
@@ -2083,6 +2093,7 @@ def evidence_context_instruction(req: ReportRequest, source_context: str, kb_con
         sections.append(
             f"""
 以下是工具从“专属文档知识库”检索出的证据片段。你必须把它与公开网页来源分开审计，并在报告中新增或填充“知识库与公开信息证据对比”内容：逐项判断哪些问题应以知识库为主、哪些应以公开信息为主、哪些需要双源交叉验证。知识库引用可使用 kb:// 内部链接；最终 HTML 会把 kb:// 引用转换为报告内“知识库证据片段”锚点，读者可点击跳转查看片段摘录与元数据。涉及重大事实、融资、客户订单、上市公司财务、政策和最新事件时，必须尽量寻找公开一手来源交叉验证。
+硬性区分：知识库里的“微信公众号候选线索”不是全文证据。凡片段标题含“候选线索”、来源类型为“微信公众号候选线索”、或正文写明“未能自动抓取全文/真实微信链接未解析”，都表示工具只获得了标题、摘要和搜狗跳转线索，模型没有读到文章正文。你不得把它用于事实判断、数据引用、公司进展、融资、订单、客户、财务、市场份额、技术指标或投资结论；只能在“待核验清单/资料缺口/后续检索关键词”里说明需要人工补全文。
 
 {kb_context}
 """
@@ -2461,6 +2472,14 @@ def render_kb_evidence_html(sources: list[dict[str, str]] | None) -> str:
         anchor = kb_anchor_id(url)
         title = html.escape(source.get("title") or f"知识库片段 {idx}")
         snippet = html.escape(source.get("snippet") or "未保存片段摘录。")
+        is_candidate_stub = str(source.get("kb_is_candidate_stub", "")).lower() == "true" or "候选线索" in (
+            source.get("source_channel", "") + source.get("title", "") + source.get("snippet", "")
+        )
+        badge = (
+            '<p class="kb-warning"><strong>候选线索，未抓取全文：</strong>该条只保存标题/摘要/跳转链接，不得作为事实证据；请人工打开并粘贴全文后再用于报告结论。</p>'
+            if is_candidate_stub
+            else ""
+        )
         meta_items = [
             ("内部引用", url),
             ("原始链接", source.get("source_url", "")),
@@ -2470,16 +2489,23 @@ def render_kb_evidence_html(sources: list[dict[str, str]] | None) -> str:
             ("页码/章节", source.get("kb_page") or source.get("kb_section", "")),
             ("分层", f"{source.get('source_tier', '')} / {source.get('source_channel', '')}".strip(" /")),
             ("信息浓度", f"{source.get('density_band', '')} {source.get('evidence_density', '')}".strip()),
+            ("使用约束", source.get("use_policy", "")),
         ]
-        meta_html = "\n".join(
-            f"<div><strong>{html.escape(label)}</strong><br>{html.escape(str(value or '未标注'))}</div>"
-            for label, value in meta_items
-        )
+        meta_parts: list[str] = []
+        for label, value in meta_items:
+            value_text = str(value or "未标注")
+            if label == "原始链接" and value_text.startswith(("http://", "https://")):
+                value_html = f'<a href="{html.escape(value_text)}" target="_blank" rel="noopener noreferrer">{html.escape(value_text)}</a>'
+            else:
+                value_html = html.escape(value_text)
+            meta_parts.append(f"<div><strong>{html.escape(label)}</strong><br>{value_html}</div>")
+        meta_html = "\n".join(meta_parts)
         cards.append(
             "\n".join(
                 [
                     f'<section class="kb-evidence-card" id="{anchor}">',
                     f"<h3>KB{idx}: {title}</h3>",
+                    badge,
                     f'<div class="kb-meta">{meta_html}</div>',
                     f'<div class="kb-snippet">{snippet}</div>',
                     '<p><a href="#top">返回顶部</a></p>',
