@@ -58,6 +58,31 @@ streamlit run app.py
 - `claude-opus-4-8[1M]`
 - `gpt-5.5`
 
+## 知识库持久化
+
+Streamlit Community Cloud 的本地磁盘不适合作为长期知识库存储：应用重启、重新部署或资源回收后，`data/knowledge_base` 可能丢失。
+
+当前工具提供两层保护：
+
+- 手动快照：在“知识库 -> 知识库备份、恢复与远端持久化”中下载完整 ZIP 快照；恢复时上传该 ZIP，可合并或替换当前知识库。
+- 远端快照：配置 S3/R2 后，每次上传、删除、公众号入库会自动同步完整知识库快照；应用重启且本地知识库为空时会自动尝试恢复。
+
+Cloudflare R2 / S3-compatible 配置示例：
+
+```powershell
+$env:INDUSTRYSCOPE_KB_S3_BUCKET="your-bucket"
+$env:INDUSTRYSCOPE_KB_S3_KEY="industryscope/kb_snapshot.zip"
+$env:INDUSTRYSCOPE_KB_S3_ENDPOINT_URL="https://<account-id>.r2.cloudflarestorage.com"
+$env:INDUSTRYSCOPE_KB_S3_REGION="auto"
+$env:INDUSTRYSCOPE_KB_S3_ACCESS_KEY_ID="..."
+$env:INDUSTRYSCOPE_KB_S3_SECRET_ACCESS_KEY="..."
+streamlit run app.py
+```
+
+在 Streamlit Cloud 中，把同名变量填入 App -> Settings -> Secrets 即可。
+
+上传建议：每批不超过 20-25 个文件，单文件不超过 100-200MB。上千份直播转写资料建议先压缩成较小批次入库，并启用 R2/S3 远端持久化。
+
 ## 设计文档
 
 工具的详细设计、参考报告分析和增强点见：

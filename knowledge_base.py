@@ -6,10 +6,13 @@ import math
 import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass, asdict
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from bs4 import BeautifulSoup
 
@@ -28,12 +31,25 @@ try:
 except ImportError:
     pd = None
 
+try:
+    import streamlit as st
+except ImportError:
+    st = None
+
 
 KB_ROOT = Path(os.getenv("INDUSTRYSCOPE_KB_DIR", "data/knowledge_base"))
 KB_FILES_DIR = KB_ROOT / "files"
 KB_INDEX_DIR = KB_ROOT / "index"
 KB_CHUNKS_PATH = KB_INDEX_DIR / "chunks.jsonl"
 KB_DOCS_PATH = KB_INDEX_DIR / "documents.json"
+KB_SNAPSHOT_ENV_KEYS = {
+    "bucket": "INDUSTRYSCOPE_KB_S3_BUCKET",
+    "key": "INDUSTRYSCOPE_KB_S3_KEY",
+    "endpoint": "INDUSTRYSCOPE_KB_S3_ENDPOINT_URL",
+    "region": "INDUSTRYSCOPE_KB_S3_REGION",
+    "access_key": "INDUSTRYSCOPE_KB_S3_ACCESS_KEY_ID",
+    "secret_key": "INDUSTRYSCOPE_KB_S3_SECRET_ACCESS_KEY",
+}
 
 
 SOURCE_TYPE_TIERS = {
@@ -268,6 +284,180 @@ def save_chunks(chunks: list[dict[str, Any]]) -> None:
     KB_CHUNKS_PATH.write_text("\n".join(json.dumps(chunk, ensure_ascii=False) for chunk in chunks), encoding="utf-8")
 
 
+def kb_file_size_bytes() -> int:
+    ensure_kb_dirs()
+    total = 0
+    for path in KB_ROOT.rglob("*"):
+        if path.is_file():
+            try:
+                total += path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def format_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size < 1024 or unit == "TB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{value} B"
+
+
+def export_kb_snapshot_bytes() -> bytes:
+    ensure_kb_dirs()
+    buffer = BytesIO()
+    with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
+        manifest = {
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "root": str(KB_ROOT),
+            "documents": len(load_documents()),
+            "chunks": len(load_chunks()),
+            "schema": "industryscope-kb-snapshot-v1",
+        }
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8"))
+        archive.write(KB_DOCS_PATH, "index/documents.json")
+        archive.write(KB_CHUNKS_PATH, "index/chunks.jsonl")
+        if KB_FILES_DIR.exists():
+            for file_path in KB_FILES_DIR.rglob("*"):
+                if file_path.is_file():
+                    archive.write(file_path, f"files/{file_path.relative_to(KB_FILES_DIR).as_posix()}")
+    return buffer.getvalue()
+
+
+def import_kb_snapshot_bytes(snapshot: bytes, merge: bool = True) -> dict[str, Any]:
+    ensure_kb_dirs()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        with ZipFile(BytesIO(snapshot)) as archive:
+            for info in archive.infolist():
+                target = (tmp_root / info.filename).resolve()
+                if not str(target).startswith(str(tmp_root.resolve())):
+                    raise RuntimeError("知识库快照包含不安全路径，已拒绝导入。")
+            archive.extractall(tmp_root)
+
+        docs_path = tmp_root / "index" / "documents.json"
+        chunks_path = tmp_root / "index" / "chunks.jsonl"
+        files_dir = tmp_root / "files"
+        if not docs_path.exists() or not chunks_path.exists():
+            raise RuntimeError("知识库快照缺少 index/documents.json 或 index/chunks.jsonl。")
+
+        incoming_docs = json.loads(docs_path.read_text(encoding="utf-8") or "{}")
+        incoming_chunks: list[dict[str, Any]] = []
+        for line in chunks_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                incoming_chunks.append(json.loads(line))
+
+        if merge:
+            docs = load_documents()
+            docs.update(incoming_docs)
+            existing_doc_ids = {chunk.get("doc_id") for chunk in incoming_chunks}
+            chunks = [chunk for chunk in load_chunks() if chunk.get("doc_id") not in existing_doc_ids]
+            chunks.extend(incoming_chunks)
+        else:
+            docs = incoming_docs
+            chunks = incoming_chunks
+            if KB_FILES_DIR.exists():
+                shutil.rmtree(KB_FILES_DIR)
+            KB_FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+        if files_dir.exists():
+            for file_path in files_dir.rglob("*"):
+                if file_path.is_file():
+                    target = KB_FILES_DIR / file_path.relative_to(files_dir)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(file_path, target)
+
+        save_documents(docs)
+        save_chunks(chunks)
+        return {"documents": len(incoming_docs), "chunks": len(incoming_chunks), "merge": merge}
+
+
+def s3_config() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for name, env_key in KB_SNAPSHOT_ENV_KEYS.items():
+        value = ""
+        if st is not None:
+            try:
+                value = str(st.secrets.get(env_key, "") or "").strip()
+            except Exception:
+                value = ""
+        values[name] = value or os.getenv(env_key, "").strip()
+    return values
+
+
+def s3_sync_enabled() -> bool:
+    cfg = s3_config()
+    return bool(cfg["bucket"] and cfg["access_key"] and cfg["secret_key"])
+
+
+def _boto3_client() -> Any:
+    try:
+        import boto3
+    except ImportError as exc:
+        raise RuntimeError("未安装 boto3，无法使用 S3/R2 知识库持久化。请在 requirements.txt 中加入 boto3。") from exc
+    cfg = s3_config()
+    kwargs: dict[str, Any] = {
+        "aws_access_key_id": cfg["access_key"],
+        "aws_secret_access_key": cfg["secret_key"],
+    }
+    if cfg["endpoint"]:
+        kwargs["endpoint_url"] = cfg["endpoint"]
+    if cfg["region"]:
+        kwargs["region_name"] = cfg["region"]
+    return boto3.client("s3", **kwargs)
+
+
+def upload_kb_snapshot_to_s3() -> str:
+    cfg = s3_config()
+    if not s3_sync_enabled():
+        return "未配置远端知识库持久化，跳过上传。"
+    key = cfg["key"] or "industryscope/kb_snapshot.zip"
+    client = _boto3_client()
+    client.put_object(
+        Bucket=cfg["bucket"],
+        Key=key,
+        Body=export_kb_snapshot_bytes(),
+        ContentType="application/zip",
+    )
+    return f"已上传知识库快照到 s3://{cfg['bucket']}/{key}"
+
+
+def restore_kb_snapshot_from_s3(merge: bool = True) -> dict[str, Any]:
+    cfg = s3_config()
+    if not s3_sync_enabled():
+        raise RuntimeError("未配置远端知识库持久化。")
+    key = cfg["key"] or "industryscope/kb_snapshot.zip"
+    client = _boto3_client()
+    response = client.get_object(Bucket=cfg["bucket"], Key=key)
+    data = response["Body"].read()
+    result = import_kb_snapshot_bytes(data, merge=merge)
+    result["remote"] = f"s3://{cfg['bucket']}/{key}"
+    return result
+
+
+def try_restore_from_s3_if_empty() -> str:
+    if not s3_sync_enabled():
+        return ""
+    if load_documents() or load_chunks():
+        return ""
+    try:
+        result = restore_kb_snapshot_from_s3(merge=False)
+        return f"已从远端恢复知识库：{result.get('documents', 0)} 个文档，{result.get('chunks', 0)} 个片段。"
+    except Exception as exc:
+        return f"远端知识库自动恢复失败：{exc}"
+
+
+def autosync_kb_snapshot() -> str:
+    if not s3_sync_enabled():
+        return ""
+    try:
+        return upload_kb_snapshot_to_s3()
+    except Exception as exc:
+        return f"知识库远端同步失败：{exc}"
+
+
 def add_document(
     source_path: Path,
     title: str = "",
@@ -420,6 +610,7 @@ def search_knowledge_base(query: str, top_k: int = 12, filters: dict[str, str] |
 def kb_stats() -> dict[str, Any]:
     docs = load_documents()
     chunks = load_chunks()
+    size_bytes = kb_file_size_bytes()
     type_counts: dict[str, int] = {}
     tier_counts: dict[str, int] = {}
     for doc in docs.values():
@@ -431,6 +622,9 @@ def kb_stats() -> dict[str, Any]:
         "type_counts": type_counts,
         "tier_counts": tier_counts,
         "root": str(KB_ROOT),
+        "size_bytes": size_bytes,
+        "size_human": format_bytes(size_bytes),
+        "remote_sync": s3_sync_enabled(),
     }
 
 
