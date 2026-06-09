@@ -24,12 +24,6 @@ from report_engine import (
 )
 from openai import APITimeoutError
 
-from browser_ingest import (
-    DEFAULT_CDP_ENDPOINT,
-    DEFAULT_OPENCLI_COMMAND,
-    ingest_current_browser_wechat_article,
-    ingest_opencli_weixin_download,
-)
 from knowledge_base import (
     SOURCE_TYPE_TIERS,
     add_document,
@@ -46,6 +40,21 @@ from knowledge_base import (
     try_restore_from_s3_if_empty,
     upload_kb_snapshot_to_s3,
 )
+
+
+DEFAULT_CDP_ENDPOINT = "http://127.0.0.1:9222"
+DEFAULT_OPENCLI_COMMAND = "opencli"
+
+
+def load_browser_ingest_function(name: str):
+    try:
+        import browser_ingest
+    except Exception as exc:
+        raise RuntimeError(f"浏览器/OpenCLI 可选增强模块加载失败：{exc}") from exc
+    try:
+        return getattr(browser_ingest, name)
+    except AttributeError as exc:
+        raise RuntimeError(f"浏览器/OpenCLI 可选增强模块缺少函数：{name}") from exc
 from quark_ingest import (
     SUPPORTED_SUFFIXES as QUARK_SUPPORTED_SUFFIXES,
     ingest_quark_files,
@@ -907,6 +916,7 @@ def render_wechat_failed_queue(
                 continue
             item = failed_candidates[index]
             try:
+                ingest_current_browser_wechat_article = load_browser_ingest_function("ingest_current_browser_wechat_article")
                 result = ingest_current_browser_wechat_article(
                     cdp_endpoint or DEFAULT_CDP_ENDPOINT,
                     keyword=keyword or item.get("keyword", "") or item.get("title", ""),
@@ -952,6 +962,7 @@ def render_wechat_failed_queue(
                 errors.append(f"{item.get('title', '未命名文章')}: 不是真实微信链接，请先打开文章复制 mp.weixin.qq.com 链接或使用当前浏览器页抽取。")
                 continue
             try:
+                ingest_opencli_weixin_download = load_browser_ingest_function("ingest_opencli_weixin_download")
                 result = ingest_opencli_weixin_download(
                     url,
                     opencli_command=opencli_command or DEFAULT_OPENCLI_COMMAND,
@@ -1294,6 +1305,7 @@ def render_knowledge_base() -> None:
             browser_url_hint = st.text_input("当前浏览器页链接提示（可选）", value="", key="wechat_browser_url_hint")
         if st.button("从当前 Chrome 公众号页抽取并入库", use_container_width=True):
             try:
+                ingest_current_browser_wechat_article = load_browser_ingest_function("ingest_current_browser_wechat_article")
                 result = ingest_current_browser_wechat_article(
                     cdp_endpoint.strip() or DEFAULT_CDP_ENDPOINT,
                     keyword=wechat_keyword.strip() or browser_title_hint.strip(),
@@ -1353,6 +1365,7 @@ def render_knowledge_base() -> None:
                     for idx, url in enumerate(urls, start=1):
                         try:
                             progress.progress(idx / len(urls), text=f"OpenCLI 正在处理第 {idx} 篇")
+                            ingest_opencli_weixin_download = load_browser_ingest_function("ingest_opencli_weixin_download")
                             result = ingest_opencli_weixin_download(
                                 url,
                                 opencli_command=opencli_command.strip() or DEFAULT_OPENCLI_COMMAND,
