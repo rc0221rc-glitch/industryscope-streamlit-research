@@ -38,6 +38,11 @@ from knowledge_base import (
     try_restore_from_s3_if_empty,
     upload_kb_snapshot_to_s3,
 )
+from quark_ingest import (
+    SUPPORTED_SUFFIXES as QUARK_SUPPORTED_SUFFIXES,
+    ingest_quark_files,
+    scan_quark_share,
+)
 from wechat_ingest import (
     fetch_wechat_article,
     ingest_wechat_article,
@@ -265,6 +270,8 @@ def ensure_state() -> None:
         "source_package": b"",
         "wechat_candidates": [],
         "kb_auto_restore_checked": False,
+        "quark_files": [],
+        "quark_info": {},
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -577,6 +584,101 @@ def render_knowledge_base() -> None:
                     st.success(f"已从 {result.get('remote')} 恢复 {result['documents']} 个文档、{result['chunks']} 个片段。")
                 except Exception as exc:
                     st.error(f"远端恢复失败：{exc}")
+
+    with st.expander("夸克网盘分享同步", expanded=False):
+        st.caption("用于大批量外部文档入库，避免通过浏览器一次上传数百个文件。公开分享通常可扫描目录；下载原文入库可能需要配置 QUARK_COOKIE 登录态。微信公众号自动补新功能保留在下方。")
+        quark_share_text = st.text_area(
+            "夸克分享链接或整段分享文本",
+            value="",
+            placeholder="例如：https://pan.quark.cn/s/5268ba221cc4?pwd=WcJR\n提取码：WcJR",
+            height=76,
+        )
+        q1, q2, q3 = st.columns([1, 1, 1])
+        with q1:
+            quark_passcode = st.text_input("提取码（可选）", value="", placeholder="例如：WcJR")
+        with q2:
+            quark_max_files = st.number_input("最多扫描文件数", min_value=10, max_value=20000, value=1000, step=50)
+        with q3:
+            quark_size_limit_mb = st.number_input("单文件下载上限MB", min_value=1, max_value=1000, value=120, step=10)
+        quark_cookie = st.text_input(
+            "QUARK_COOKIE（可选，建议配置到 Streamlit Secrets）",
+            value="",
+            placeholder="不填也可扫描公开分享；若下载提示 require login，需要填入夸克网页版登录后的 Cookie。",
+            type="password",
+        )
+        qtag1, qtag2, qtag3 = st.columns(3)
+        with qtag1:
+            quark_source_type = st.selectbox("夸克入库来源类型", list(SOURCE_TYPE_TIERS.keys()), index=list(SOURCE_TYPE_TIERS.keys()).index("券商/投行/咨询研报"), key="quark_source_type")
+            quark_industry_tags = st.text_input("夸克入库行业标签", value="", key="quark_industry_tags")
+        with qtag2:
+            quark_source_org = st.text_input("夸克入库来源机构", value="夸克网盘", key="quark_source_org")
+            quark_company_tags = st.text_input("夸克入库公司标签", value="", key="quark_company_tags")
+        with qtag3:
+            quark_technology_tags = st.text_input("夸克入库技术标签", value="", key="quark_technology_tags")
+            st.caption("支持：" + ", ".join(sorted(QUARK_SUPPORTED_SUFFIXES)))
+
+        if st.button("扫描夸克分享目录", use_container_width=True):
+            if not quark_share_text.strip():
+                st.error("请先填写夸克分享链接或整段分享文本。")
+            else:
+                try:
+                    with st.spinner("正在扫描夸克分享目录..."):
+                        info, files = scan_quark_share(
+                            quark_share_text.strip(),
+                            passcode=quark_passcode.strip(),
+                            cookie=quark_cookie.strip(),
+                            max_files=int(quark_max_files),
+                        )
+                    st.session_state["quark_info"] = info.__dict__
+                    st.session_state["quark_files"] = [file.__dict__ for file in files]
+                    st.success(f"扫描完成：{len(files)} 个文件，总大小约 {round(sum(f.size for f in files) / 1024 / 1024, 1)} MB。")
+                except Exception as exc:
+                    st.session_state["quark_files"] = []
+                    st.error(f"夸克扫描失败：{exc}")
+
+        quark_files = st.session_state.get("quark_files", [])
+        if quark_files:
+            rows = []
+            for idx, file in enumerate(quark_files, start=1):
+                suffix = file.get("suffix", "")
+                rows.append({
+                    "选择": suffix in QUARK_SUPPORTED_SUFFIXES,
+                    "序号": idx,
+                    "文件名": file.get("name", ""),
+                    "路径": file.get("path", ""),
+                    "大小MB": round((file.get("size", 0) or 0) / 1024 / 1024, 2),
+                    "类型": suffix,
+                })
+            edited = st.data_editor(
+                rows,
+                use_container_width=True,
+                hide_index=True,
+                disabled=["序号", "文件名", "路径", "大小MB", "类型"],
+                key="quark_file_editor",
+            )
+            if st.button("下载所选夸克文件并入库", type="primary", use_container_width=True):
+                selected = [quark_files[int(row["序号"]) - 1] for row in edited if row.get("选择")]
+                if not selected:
+                    st.error("请至少选择一个夸克文件。")
+                else:
+                    with st.spinner("正在从夸克下载并入库。大文件会比较慢，请保持页面打开..."):
+                        ok, errors = ingest_quark_files(
+                            quark_share_text.strip(),
+                            quark_passcode.strip(),
+                            selected,
+                            cookie=quark_cookie.strip(),
+                            source_type=quark_source_type,
+                            source_org=quark_source_org.strip() or "夸克网盘",
+                            industry_tags=quark_industry_tags.strip(),
+                            company_tags=quark_company_tags.strip(),
+                            technology_tags=quark_technology_tags.strip(),
+                            size_limit_mb=int(quark_size_limit_mb),
+                        )
+                    if ok:
+                        st.success(f"成功入库 {ok} 个夸克文件。")
+                        sync_kb_after_write()
+                    if errors:
+                        st.error("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
 
     with st.expander("微信公众号自动补新", expanded=False):
         st.caption("通过搜狗微信搜索发现公开公众号文章，抓取可访问正文并生成 Markdown 文档入库。遇到验证码、过期链接或微信环境校验时会跳过并提示。")
