@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +56,18 @@ def load_browser_ingest_function(name: str):
         return getattr(browser_ingest, name)
     except AttributeError as exc:
         raise RuntimeError(f"浏览器/OpenCLI 可选增强模块缺少函数：{name}") from exc
+
+
+def is_streamlit_cloud() -> bool:
+    return bool(os.getenv("STREAMLIT_SHARING") or os.getenv("STREAMLIT_SERVER_HEADLESS"))
+
+
+def local_bridge_unavailable_hint() -> str:
+    return (
+        "当前部署环境无法访问你电脑上的 Chrome。Streamlit Cloud 里的 127.0.0.1 是云服务器自己，"
+        "不是你的本机浏览器；本机浏览器抽取和 OpenCLI Browser Bridge 只适合本地运行 IndustryScope，"
+        "或另行配置可被云端访问的安全桥接服务。云端请使用“打开文章 -> 通过验证 -> Chrome 书签采集 -> 粘贴 JSON 入库”。"
+    )
 from quark_ingest import (
     SUPPORTED_SUFFIXES as QUARK_SUPPORTED_SUFFIXES,
     ingest_quark_files,
@@ -836,8 +849,11 @@ def render_wechat_failed_queue(
         return
 
     st.markdown("#### 待手动补全文队列")
-    st.caption("这些是系统已经自动尝试抓正文但失败的文章。你可以先点“再自动补抓一轮”；仍失败的，再打开文章、通过验证、点击 Chrome 书签栏里的 IndustryScope采集，然后把采集 JSON 粘回上方入库。")
+    st.caption("这些是系统已经自动尝试抓正文但失败的文章。搜狗跳转验证码出现后，云端无法稳定解析真实微信链接；主流程是打开文章、通过验证、点击 Chrome 书签栏里的 IndustryScope采集，然后把采集 JSON 粘回上方入库。")
     st.info(f"当前有 {len(failed_candidates)} 篇待补全文。候选线索已入库，但不会作为报告强证据；补入全文后才会进入报告证据池。")
+    if is_streamlit_cloud():
+        st.warning(local_bridge_unavailable_hint())
+    st.success("推荐处理顺序：先点下方“快速打开文章”，通过搜狗/微信验证后在正文页点击 Chrome 书签栏的 IndustryScope采集；回到上方“粘贴采集 JSON”入库。不要用 OpenCLI 直接处理搜狗跳转链接，它只接受真实 mp.weixin.qq.com 链接。")
 
     render_wechat_quick_open_panel(failed_candidates)
     rows = []
@@ -903,90 +919,103 @@ def render_wechat_failed_queue(
             clear_wechat_failed_candidates()
             st.success("已清空待手动补全文队列。")
 
-    st.markdown("##### 从当前浏览器页补全文")
-    st.caption("适合处理已经在 Chrome 中打开并通过验证的公众号文章。先在上表勾选对应文章，再让 Chrome 当前页停在正文页，点击下面按钮即可从真实浏览器 DOM 抽取并入库。")
-    if st.button("用当前浏览器公众号页补当前勾选", use_container_width=True):
-        if not selected_indexes:
-            st.error("请先在失败队列里勾选一篇文章。")
-            return
-        ok = 0
-        errors: list[str] = []
-        for index in selected_indexes:
-            if index < 0 or index >= len(failed_candidates):
-                continue
-            item = failed_candidates[index]
-            try:
-                ingest_current_browser_wechat_article = load_browser_ingest_function("ingest_current_browser_wechat_article")
-                result = ingest_current_browser_wechat_article(
-                    cdp_endpoint or DEFAULT_CDP_ENDPOINT,
-                    keyword=keyword or item.get("keyword", "") or item.get("title", ""),
-                    industry_tags=industry_tags or keyword or item.get("title", ""),
-                    company_tags=company_tags,
-                    technology_tags=technology_tags,
-                    url_hint=item.get("url", "") or item.get("search_url", ""),
-                    title_hint=item.get("title", ""),
-                    search_rank=int(item.get("rank", index + 1) or index + 1),
-                )
-                article = result.get("article", {})
-                ok += 1
-                remove_wechat_failed_candidate(
-                    url=article.get("url", "") if isinstance(article, dict) else "",
-                    title=article.get("title", item.get("title", "")) if isinstance(article, dict) else item.get("title", ""),
-                    account=article.get("account", item.get("account", "")) if isinstance(article, dict) else item.get("account", ""),
-                    other=item,
-                )
-                st.toast(f"已从浏览器入库：{result['document'].get('title', item.get('title', '未命名文章'))}")
-            except Exception as exc:
-                errors.append(f"{item.get('title', '未命名文章')}: {exc}")
-                upsert_wechat_failed_candidate(item, str(exc), keyword=keyword or item.get("keyword", ""))
-        if ok:
-            st.success(f"已从当前浏览器页补全文并入库 {ok} 篇。")
-            sync_kb_after_write()
-        if errors:
-            st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
+    with st.expander("本地运行专用：CDP / OpenCLI 补抓", expanded=False):
+        st.caption("只有当 IndustryScope 和 Chrome/OpenCLI 运行在同一台电脑上时，这里才可用。Streamlit Cloud 上的 127.0.0.1 不是你的电脑。")
+        if is_streamlit_cloud():
+            st.warning(local_bridge_unavailable_hint())
+        st.markdown("##### 从当前浏览器页补全文")
+        st.caption("适合处理已经在 Chrome 中打开并通过验证的公众号文章。先在上表勾选对应文章，再让 Chrome 当前页停在正文页，点击下面按钮即可从真实浏览器 DOM 抽取并入库。")
+        if st.button("用当前浏览器公众号页补当前勾选", use_container_width=True):
+            if is_streamlit_cloud():
+                st.error(local_bridge_unavailable_hint())
+                return
+            if not selected_indexes:
+                st.error("请先在失败队列里勾选一篇文章。")
+                return
+            if len(selected_indexes) > 1:
+                st.error("当前浏览器页一次只能对应一篇文章。请只勾选当前 Chrome 正文页对应的那一篇。")
+                return
+            ok = 0
+            errors: list[str] = []
+            for index in selected_indexes:
+                if index < 0 or index >= len(failed_candidates):
+                    continue
+                item = failed_candidates[index]
+                try:
+                    ingest_current_browser_wechat_article = load_browser_ingest_function("ingest_current_browser_wechat_article")
+                    result = ingest_current_browser_wechat_article(
+                        cdp_endpoint or DEFAULT_CDP_ENDPOINT,
+                        keyword=keyword or item.get("keyword", "") or item.get("title", ""),
+                        industry_tags=industry_tags or keyword or item.get("title", ""),
+                        company_tags=company_tags,
+                        technology_tags=technology_tags,
+                        url_hint=item.get("url", "") or item.get("search_url", ""),
+                        title_hint=item.get("title", ""),
+                        search_rank=int(item.get("rank", index + 1) or index + 1),
+                    )
+                    article = result.get("article", {})
+                    ok += 1
+                    remove_wechat_failed_candidate(
+                        url=article.get("url", "") if isinstance(article, dict) else "",
+                        title=article.get("title", item.get("title", "")) if isinstance(article, dict) else item.get("title", ""),
+                        account=article.get("account", item.get("account", "")) if isinstance(article, dict) else item.get("account", ""),
+                        other=item,
+                    )
+                    st.toast(f"已从浏览器入库：{result['document'].get('title', item.get('title', '未命名文章'))}")
+                except Exception as exc:
+                    errors.append(f"{item.get('title', '未命名文章')}: {exc}")
+                    upsert_wechat_failed_candidate(item, str(exc), keyword=keyword or item.get("keyword", ""))
+            if ok:
+                st.success(f"已从当前浏览器页补全文并入库 {ok} 篇。")
+                sync_kb_after_write()
+            if errors:
+                st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
 
-    st.markdown("##### 用 OpenCLI 补真实微信链接")
-    st.caption("适合失败队列中已经有真实 mp.weixin.qq.com 链接的文章。搜狗跳转链接无法直接下载，需先打开文章取得真实链接。")
-    if st.button("用 OpenCLI 下载当前勾选真实微信链接", use_container_width=True):
-        if not selected_indexes:
-            st.error("请先在失败队列里勾选至少一篇文章。")
-            return
-        ok = 0
-        errors: list[str] = []
-        for index in selected_indexes:
-            if index < 0 or index >= len(failed_candidates):
-                continue
-            item = failed_candidates[index]
-            url = item.get("url", "") or item.get("source_url", "")
-            if "mp.weixin.qq.com" not in url:
-                errors.append(f"{item.get('title', '未命名文章')}: 不是真实微信链接，请先打开文章复制 mp.weixin.qq.com 链接或使用当前浏览器页抽取。")
-                continue
-            try:
-                ingest_opencli_weixin_download = load_browser_ingest_function("ingest_opencli_weixin_download")
-                result = ingest_opencli_weixin_download(
-                    url,
-                    opencli_command=opencli_command or DEFAULT_OPENCLI_COMMAND,
-                    keyword=keyword or item.get("keyword", "") or item.get("title", ""),
-                    industry_tags=industry_tags or keyword or item.get("title", ""),
-                    company_tags=company_tags,
-                    technology_tags=technology_tags,
-                )
-                ok += 1
-                remove_wechat_failed_candidate(
-                    url=result.get("source_url", url),
-                    title=result.get("title", item.get("title", "")),
-                    account=item.get("account", ""),
-                    other=item,
-                )
-                st.toast(f"OpenCLI 已入库：{result['document'].get('title', item.get('title', '未命名文章'))}")
-            except Exception as exc:
-                errors.append(f"{item.get('title', '未命名文章')}: {exc}")
-                upsert_wechat_failed_candidate(item, str(exc), keyword=keyword or item.get("keyword", ""))
-        if ok:
-            st.success(f"OpenCLI 成功下载并入库 {ok} 篇。")
-            sync_kb_after_write()
-        if errors:
-            st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
+        st.markdown("##### 用 OpenCLI 补真实微信链接")
+        st.caption("适合失败队列中已经有真实 mp.weixin.qq.com 链接的文章。搜狗跳转链接无法直接下载，需先打开文章取得真实链接。")
+        if st.button("用 OpenCLI 下载当前勾选真实微信链接", use_container_width=True):
+            if is_streamlit_cloud():
+                st.error(local_bridge_unavailable_hint())
+                return
+            if not selected_indexes:
+                st.error("请先在失败队列里勾选至少一篇文章。")
+                return
+            ok = 0
+            errors: list[str] = []
+            for index in selected_indexes:
+                if index < 0 or index >= len(failed_candidates):
+                    continue
+                item = failed_candidates[index]
+                url = item.get("url", "") or item.get("source_url", "")
+                if "mp.weixin.qq.com" not in url:
+                    errors.append(f"{item.get('title', '未命名文章')}: 不是真实微信链接，请先打开文章复制 mp.weixin.qq.com 链接或使用当前浏览器页抽取。")
+                    continue
+                try:
+                    ingest_opencli_weixin_download = load_browser_ingest_function("ingest_opencli_weixin_download")
+                    result = ingest_opencli_weixin_download(
+                        url,
+                        opencli_command=opencli_command or DEFAULT_OPENCLI_COMMAND,
+                        keyword=keyword or item.get("keyword", "") or item.get("title", ""),
+                        industry_tags=industry_tags or keyword or item.get("title", ""),
+                        company_tags=company_tags,
+                        technology_tags=technology_tags,
+                    )
+                    ok += 1
+                    remove_wechat_failed_candidate(
+                        url=result.get("source_url", url),
+                        title=result.get("title", item.get("title", "")),
+                        account=item.get("account", ""),
+                        other=item,
+                    )
+                    st.toast(f"OpenCLI 已入库：{result['document'].get('title', item.get('title', '未命名文章'))}")
+                except Exception as exc:
+                    errors.append(f"{item.get('title', '未命名文章')}: {exc}")
+                    upsert_wechat_failed_candidate(item, str(exc), keyword=keyword or item.get("keyword", ""))
+            if ok:
+                st.success(f"OpenCLI 成功下载并入库 {ok} 篇。")
+                sync_kb_after_write()
+            if errors:
+                st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
 
 
 def sync_kb_after_write() -> None:
@@ -1286,6 +1315,8 @@ def render_knowledge_base() -> None:
 
         st.markdown("#### 本机浏览器抽取入库（可选增强）")
         st.caption("用于替代反复粘贴正文：在本机 Chrome 打开公众号正文并通过验证后，工具通过 Chrome DevTools/web-access 类本机桥接读取真实页面 DOM。Streamlit Cloud 不能直接读取你电脑里的 Chrome，需本地运行或配置本机桥接服务。")
+        if is_streamlit_cloud():
+            st.warning(local_bridge_unavailable_hint())
         with st.popover("如何启动 Chrome 本机抽取"):
             st.markdown("1. 关闭所有 Chrome 窗口，或使用一个单独的 Chrome 用户目录。")
             st.code(r'start chrome --remote-debugging-port=9222 --user-data-dir="%TEMP%\industryscope-chrome"', language="powershell")
@@ -1304,6 +1335,9 @@ def render_knowledge_base() -> None:
         with col_browser_ingest2:
             browser_url_hint = st.text_input("当前浏览器页链接提示（可选）", value="", key="wechat_browser_url_hint")
         if st.button("从当前 Chrome 公众号页抽取并入库", use_container_width=True):
+            if is_streamlit_cloud():
+                st.error(local_bridge_unavailable_hint())
+                return
             try:
                 ingest_current_browser_wechat_article = load_browser_ingest_function("ingest_current_browser_wechat_article")
                 result = ingest_current_browser_wechat_article(
@@ -1334,6 +1368,8 @@ def render_knowledge_base() -> None:
 
         st.markdown("#### OpenCLI 微信下载入库（可选增强）")
         st.caption("OpenCLI 的 Browser Bridge + weixin adapter 可把真实 mp.weixin.qq.com 文章导出为 Markdown，并可下载图片。适合已经拿到真实微信链接后的标准化归档；未安装 OpenCLI 时会给出提示。")
+        if is_streamlit_cloud():
+            st.warning("OpenCLI/Browser Bridge 在 Streamlit Cloud 上默认不可用；它需要和你的 Chrome/Bridge 在同一台机器上运行。云端请优先使用上方书签采集 JSON 入库。")
         with st.popover("OpenCLI 使用边界"):
             st.markdown("1. OpenCLI 不是验证码破解工具；它复用你本机浏览器/Bridge 的可访问状态。")
             st.markdown("2. 这里需要真实 `mp.weixin.qq.com` 链接，搜狗跳转链接请先打开文章后复制真实链接。")
@@ -1354,6 +1390,9 @@ def render_knowledge_base() -> None:
         )
         opencli_download_images = st.toggle("OpenCLI 下载图片", value=True, key="wechat_opencli_download_images")
         if st.button("用 OpenCLI 下载并入库微信文章", use_container_width=True):
+            if is_streamlit_cloud():
+                st.error(local_bridge_unavailable_hint())
+                return
             urls = [line.strip() for line in opencli_urls.splitlines() if line.strip()]
             if not urls:
                 st.error("请先粘贴至少一个真实 mp.weixin.qq.com 链接。")
