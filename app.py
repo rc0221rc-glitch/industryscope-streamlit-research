@@ -46,6 +46,7 @@ from quark_ingest import (
 from wechat_ingest import (
     fetch_wechat_article,
     ingest_wechat_article,
+    ingest_wechat_candidate_stub,
     resolve_sogou_search_url,
     search_sogou_wechat,
 )
@@ -416,6 +417,7 @@ def ingest_wechat_candidates(
     technology_tags: str,
 ) -> tuple[int, list[str]]:
     ok = 0
+    stub_ok = 0
     errors: list[str] = []
     if not selected_indexes:
         return ok, ["请至少选择一篇文章。"]
@@ -446,10 +448,24 @@ def ingest_wechat_candidates(
                 ok += 1
                 st.toast(f"已入库：{result['document'].get('title', title)}")
             except Exception as exc:
-                errors.append(f"{title}: {exc}")
+                try:
+                    stub = ingest_wechat_candidate_stub(
+                        item,
+                        keyword=keyword,
+                        industry_tags=industry_tags or keyword,
+                        company_tags=company_tags,
+                        technology_tags=technology_tags,
+                        error=str(exc),
+                    )
+                    stub_ok += 1
+                    st.toast(f"已入库候选线索：{stub['document'].get('title', title)}")
+                except Exception as stub_exc:
+                    errors.append(f"{title}: 全文抓取失败：{exc}；候选线索入库也失败：{stub_exc}")
     finally:
         progress.empty()
-    return ok, errors
+    if stub_ok:
+        st.warning(f"{stub_ok} 篇文章未能自动抓全文，已作为“候选线索/待补全文”正式入库。")
+    return ok + stub_ok, errors
 
 
 def sync_kb_after_write() -> None:

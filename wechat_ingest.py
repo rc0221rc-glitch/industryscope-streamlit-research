@@ -241,6 +241,66 @@ def article_to_markdown(article: WechatArticle, keyword: str, search_rank: int =
     )
 
 
+def candidate_to_markdown(candidate: dict[str, Any], keyword: str, error: str = "") -> str:
+    title = candidate.get("title") or "微信公众号候选文章"
+    return "\n".join(
+        [
+            f"# {title}",
+            "",
+            "## 元数据",
+            f"- 搜狗候选链接：{candidate.get('search_url') or '未记录'}",
+            f"- 真实微信链接：{candidate.get('url') or '未解析'}",
+            f"- 公众号/作者：{candidate.get('account') or '未识别'}",
+            f"- 发布日期：{candidate.get('published_at') or '未识别'}",
+            f"- 搜索关键词：{keyword}",
+            f"- 搜索排序：{candidate.get('rank') or '未记录'}",
+            "- 入库状态：候选线索，未能自动抓取全文",
+            f"- 抓取失败原因：{error or candidate.get('error') or '未记录'}",
+            "- 来源说明：由 IndustryScope 通过搜狗微信搜索发现。该文档只保存标题、摘要和候选链接，作为待补全文线索；不得单独支撑市场规模、份额、融资、订单、财务或全球第一等强结论。",
+            "",
+            "## 摘要",
+            "",
+            candidate.get("snippet") or "无摘要。",
+            "",
+            "## 后续处理",
+            "",
+            "如需全文证据，请手动打开搜狗候选链接或微信文章，复制 mp.weixin.qq.com 原文链接到“手动粘贴微信文章链接”入口重新入库。",
+            "",
+        ]
+    )
+
+
+def ingest_wechat_candidate_stub(
+    candidate: dict[str, Any],
+    keyword: str,
+    industry_tags: str = "",
+    company_tags: str = "",
+    technology_tags: str = "",
+    error: str = "",
+) -> dict[str, Any]:
+    markdown_text = candidate_to_markdown(candidate, keyword, error=error)
+    title = f"{candidate.get('title') or '微信公众号候选文章'}（候选线索）"
+    safe_name = filename_safe(title)[:90]
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".md", mode="w", encoding="utf-8") as tmp:
+        tmp.write(markdown_text)
+        tmp_path = Path(tmp.name)
+    try:
+        doc = add_document(
+            tmp_path,
+            title=title,
+            source_type="公众号/媒体转载",
+            source_org=candidate.get("account", ""),
+            publish_date=candidate.get("published_at", ""),
+            industry_tags=industry_tags or keyword,
+            company_tags=company_tags,
+            technology_tags=technology_tags,
+            source_url=candidate.get("url") or candidate.get("search_url", ""),
+        )
+        return {"document": asdict(doc), "markdown": markdown_text}
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def ingest_wechat_article(
     article: WechatArticle,
     keyword: str,
