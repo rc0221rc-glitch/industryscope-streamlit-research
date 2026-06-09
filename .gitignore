@@ -6,5 +6,6 @@ venv/
 .streamlit/secrets.toml
 work/
 data/knowledge_base/
+data/wechat_cache/
 *.log
 *.tmp

@@ -160,6 +160,161 @@ def render_wechat_quick_open_panel(candidates: list[dict]) -> None:
     )
 
 
+def normalize_wechat_identity(value: str) -> str:
+    return "".join(str(value or "").split()).lower()
+
+
+def normalize_wechat_url(value: str) -> str:
+    text = str(value or "").strip().split("#", 1)[0]
+    return text.rstrip("/")
+
+
+def wechat_candidate_urls(item: dict) -> set[str]:
+    urls = {
+        normalize_wechat_url(item.get("url", "")),
+        normalize_wechat_url(item.get("search_url", "")),
+        normalize_wechat_url(item.get("source_url", "")),
+    }
+    return {url for url in urls if url}
+
+
+def wechat_candidate_key(item: dict) -> str:
+    for field in ("url", "search_url", "source_url"):
+        url = normalize_wechat_url(item.get(field, ""))
+        if url:
+            return f"url|{url}"
+    for url in sorted(wechat_candidate_urls(item)):
+        return f"url|{url}"
+    title = normalize_wechat_identity(item.get("title", ""))
+    account = normalize_wechat_identity(item.get("account", "") or item.get("source_org", ""))
+    return f"title|{title}|{account}" if title else ""
+
+
+def get_wechat_failed_candidates() -> list[dict]:
+    queue = st.session_state.setdefault("wechat_failed_candidates", [])
+    if not isinstance(queue, list):
+        queue = []
+    clean_queue = [item for item in queue if isinstance(item, dict)]
+    if clean_queue is not queue:
+        st.session_state["wechat_failed_candidates"] = clean_queue
+    return clean_queue
+
+
+def wechat_items_match(
+    item: dict,
+    *,
+    url: str = "",
+    title: str = "",
+    account: str = "",
+    other: dict | None = None,
+) -> bool:
+    other = other or {}
+    item_key = wechat_candidate_key(item)
+    other_key = wechat_candidate_key(other)
+    if item_key and other_key and item_key == other_key:
+        return True
+
+    target_urls = {normalize_wechat_url(url)} if url else set()
+    target_urls |= wechat_candidate_urls(other)
+    if target_urls and wechat_candidate_urls(item) & {value for value in target_urls if value}:
+        return True
+
+    target_title = normalize_wechat_identity(title or other.get("title", ""))
+    item_title = normalize_wechat_identity(item.get("title", ""))
+    if not target_title or not item_title:
+        return False
+    title_matches = item_title == target_title or (
+        min(len(item_title), len(target_title)) >= 8 and (item_title in target_title or target_title in item_title)
+    )
+    if not title_matches:
+        return False
+
+    target_account = normalize_wechat_identity(account or other.get("account", "") or other.get("source_org", ""))
+    item_account = normalize_wechat_identity(item.get("account", "") or item.get("source_org", ""))
+    return not target_account or not item_account or target_account in item_account or item_account in target_account
+
+
+def upsert_wechat_failed_candidate(item: dict, error: str, keyword: str = "") -> dict:
+    queue = get_wechat_failed_candidates()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    record = dict(item)
+    record.update(
+        {
+            "error": str(error),
+            "failed_at": now,
+            "manual_status": "待手动补全文",
+        }
+    )
+    if keyword:
+        record["keyword"] = keyword
+
+    for idx, existing in enumerate(queue):
+        if wechat_items_match(existing, other=record):
+            first_failed_at = existing.get("first_failed_at") or existing.get("failed_at") or now
+            merged = dict(existing)
+            merged.update(record)
+            merged["first_failed_at"] = first_failed_at
+            queue[idx] = merged
+            st.session_state["wechat_failed_candidates"] = queue
+            return merged
+
+    record["first_failed_at"] = now
+    queue.append(record)
+    st.session_state["wechat_failed_candidates"] = queue
+    return record
+
+
+def remove_wechat_failed_candidate(
+    *,
+    url: str = "",
+    title: str = "",
+    account: str = "",
+    other: dict | None = None,
+) -> int:
+    queue = get_wechat_failed_candidates()
+    if not queue:
+        return 0
+    kept: list[dict] = []
+    removed = 0
+    for item in queue:
+        if wechat_items_match(item, url=url, title=title, account=account, other=other):
+            removed += 1
+        else:
+            kept.append(item)
+    st.session_state["wechat_failed_candidates"] = kept
+    return removed
+
+
+def clear_wechat_failed_candidates() -> None:
+    st.session_state["wechat_failed_candidates"] = []
+
+
+def rows_from_editor(value) -> list[dict]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [row for row in value if isinstance(row, dict)]
+    if hasattr(value, "to_dict"):
+        try:
+            rows = value.to_dict("records")
+            if isinstance(rows, list):
+                return [row for row in rows if isinstance(row, dict)]
+        except Exception:
+            return []
+    return []
+
+
+def selected_indexes_from_editor(value) -> list[int]:
+    indexes: list[int] = []
+    for row in rows_from_editor(value):
+        if row.get("选择"):
+            try:
+                indexes.append(int(row["序号"]) - 1)
+            except (KeyError, TypeError, ValueError):
+                continue
+    return indexes
+
+
 PROVIDER_PRESETS = {
     "OpenAI Responses": {
         "model": config_value("OPENAI_MODEL", "gpt-5.1"),
@@ -496,12 +651,13 @@ def ingest_wechat_candidates(
     industry_tags: str,
     company_tags: str,
     technology_tags: str,
-) -> tuple[int, list[str]]:
+    create_stub_on_failure: bool = True,
+) -> tuple[int, int, list[str]]:
     ok = 0
     stub_ok = 0
     errors: list[str] = []
     if not selected_indexes:
-        return ok, ["请至少选择一篇文章。"]
+        return ok, stub_ok, ["请至少选择一篇文章。"]
     progress = st.progress(0, text="正在入库公众号文章")
     try:
         for order, candidate_index in enumerate(selected_indexes, start=1):
@@ -519,8 +675,20 @@ def ingest_wechat_candidates(
                     search_rank=int(item.get("rank", candidate_index + 1)),
                 )
                 ok += 1
+                remove_wechat_failed_candidate(
+                    url=article.url,
+                    title=article.title or title,
+                    account=article.account,
+                    other=item,
+                )
                 st.toast(f"已入库：{result['document'].get('title', title)}")
             except Exception as exc:
+                item["status"] = "待手动补全文"
+                item["error"] = str(exc)
+                upsert_wechat_failed_candidate(item, str(exc), keyword=keyword)
+                if not create_stub_on_failure:
+                    errors.append(f"{title}: {exc}")
+                    continue
                 try:
                     stub = ingest_wechat_candidate_stub(
                         item,
@@ -537,8 +705,8 @@ def ingest_wechat_candidates(
     finally:
         progress.empty()
     if stub_ok:
-        st.warning(f"{stub_ok} 篇文章未能自动抓全文，已作为“候选线索/待补全文”正式入库。")
-    return ok + stub_ok, errors
+        st.warning(f"{stub_ok} 篇文章未能自动抓全文，已进入“待手动补全文队列”，同时作为候选线索入库。")
+    return ok, stub_ok, errors
 
 
 def fetch_candidate_article(item: dict, title: str, browser_state: str = ""):
@@ -622,12 +790,101 @@ def ingest_wechat_candidates_with_browser_state(
                     search_rank=int(item.get("rank", candidate_index + 1)),
                 )
                 ok += 1
+                remove_wechat_failed_candidate(
+                    url=article.url,
+                    title=article.title or title,
+                    account=article.account,
+                    other=item,
+                )
                 st.toast(f"已补全文：{result['document'].get('title', title)}")
             except Exception as exc:
+                item["status"] = "待手动补全文"
+                item["error"] = str(exc)
+                upsert_wechat_failed_candidate(item, str(exc), keyword=keyword)
                 errors.append(f"{title}: {exc}")
     finally:
         progress.empty()
     return ok, errors
+
+
+def render_wechat_failed_queue(
+    keyword: str,
+    industry_tags: str,
+    company_tags: str,
+    technology_tags: str,
+    browser_state: str = "",
+) -> None:
+    failed_candidates = get_wechat_failed_candidates()
+    if not failed_candidates:
+        return
+
+    st.markdown("#### 待手动补全文队列")
+    st.caption("这些是系统已经自动尝试抓正文但失败的文章。你可以先点“再自动补抓一轮”；仍失败的，再打开文章、通过验证、点击 Chrome 书签栏里的 IndustryScope采集，然后把采集 JSON 粘回上方入库。")
+    st.info(f"当前有 {len(failed_candidates)} 篇待补全文。候选线索已入库，但不会作为报告强证据；补入全文后才会进入报告证据池。")
+
+    render_wechat_quick_open_panel(failed_candidates)
+    rows = []
+    for idx, item in enumerate(failed_candidates, start=1):
+        rows.append({
+            "选择": True,
+            "序号": idx,
+            "标题": item.get("title", ""),
+            "打开": item.get("url") or item.get("search_url", ""),
+            "公众号": item.get("account", ""),
+            "日期": item.get("published_at", "") or "未识别",
+            "失败时间": item.get("failed_at", ""),
+            "失败原因": item.get("error", ""),
+        })
+
+    edited_failed = st.data_editor(
+        rows,
+        use_container_width=True,
+        hide_index=True,
+        disabled=["序号", "标题", "打开", "公众号", "日期", "失败时间", "失败原因"],
+        column_config={
+            "打开": st.column_config.LinkColumn("打开", display_text="打开文章"),
+            "失败原因": st.column_config.TextColumn("失败原因", width="large"),
+        },
+        key="wechat_failed_queue_editor",
+    )
+    selected_indexes = selected_indexes_from_editor(edited_failed)
+    col_retry1, col_retry2, col_retry3 = st.columns(3)
+    with col_retry1:
+        if st.button("对失败队列再自动补抓一轮", use_container_width=True):
+            ok, _, errors = ingest_wechat_candidates(
+                failed_candidates,
+                selected_indexes,
+                keyword=keyword,
+                industry_tags=industry_tags,
+                company_tags=company_tags,
+                technology_tags=technology_tags,
+                create_stub_on_failure=False,
+            )
+            if ok:
+                st.success(f"自动补抓成功 {ok} 篇，成功项已从待补全文队列移除。")
+                sync_kb_after_write()
+            if errors:
+                st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
+    with col_retry2:
+        if st.button("用浏览器状态补抓失败队列", use_container_width=True):
+            ok, errors = ingest_wechat_candidates_with_browser_state(
+                failed_candidates,
+                selected_indexes,
+                keyword=keyword,
+                industry_tags=industry_tags,
+                company_tags=company_tags,
+                technology_tags=technology_tags,
+                browser_state=browser_state,
+            )
+            if ok:
+                st.success(f"浏览器状态补抓成功 {ok} 篇，成功项已从队列移除。")
+                sync_kb_after_write()
+            if errors:
+                st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
+    with col_retry3:
+        if st.button("清空待补全文队列", use_container_width=True):
+            clear_wechat_failed_candidates()
+            st.success("已清空待手动补全文队列。")
 
 
 def sync_kb_after_write() -> None:
@@ -835,7 +1092,7 @@ def render_knowledge_base() -> None:
                 key="quark_file_editor",
             )
             if st.button("下载所选夸克文件并入库", type="primary", use_container_width=True):
-                selected = [quark_files[int(row["序号"]) - 1] for row in edited if row.get("选择")]
+                selected = [quark_files[index] for index in selected_indexes_from_editor(edited) if 0 <= index < len(quark_files)]
                 if not selected:
                     st.error("请至少选择一个夸克文件。")
                 else:
@@ -912,7 +1169,15 @@ def render_knowledge_base() -> None:
                 )
                 clip = result.get("clip", {})
                 image_count = len(clip.get("images", [])) if isinstance(clip, dict) else 0
+                removed = remove_wechat_failed_candidate(
+                    url=clip.get("url", "") if isinstance(clip, dict) else "",
+                    title=clip.get("title", "") if isinstance(clip, dict) else "",
+                    account=clip.get("account", "") if isinstance(clip, dict) else "",
+                    other=clip if isinstance(clip, dict) else None,
+                )
                 st.success(f"已入库采集正文：{result['document'].get('title', '未命名文章')}；图片/图表线索 {image_count} 个。")
+                if removed:
+                    st.toast(f"已从待补全文队列移除 {removed} 条匹配文章。")
                 sync_kb_after_write()
             except Exception as exc:
                 st.error(f"采集正文入库失败：{exc}")
@@ -947,7 +1212,14 @@ def render_knowledge_base() -> None:
                     company_tags=wechat_company_tags.strip(),
                     technology_tags=wechat_technology_tags.strip(),
                 )
+                removed = remove_wechat_failed_candidate(
+                    url=manual_full_url.strip(),
+                    title=manual_full_title.strip(),
+                    account=manual_full_account.strip(),
+                )
                 st.success(f"已入库公众号全文：{result['document'].get('title', manual_full_title or '未命名文章')}")
+                if removed:
+                    st.toast(f"已从待补全文队列移除 {removed} 条匹配文章。")
                 sync_kb_after_write()
             except Exception as exc:
                 st.error(f"全文入库失败：{exc}")
@@ -984,7 +1256,7 @@ def render_knowledge_base() -> None:
                     if candidates:
                         st.success(f"找到 {len(candidates)} 条候选。日期无法识别的文章会保留搜索排序。")
                         selected_indexes = list(range(min(wechat_ingest_count, len(candidates))))
-                        ok, errors = ingest_wechat_candidates(
+                        ok, stub_ok, errors = ingest_wechat_candidates(
                             st.session_state["wechat_candidates"],
                             selected_indexes,
                             keyword=wechat_keyword.strip(),
@@ -993,7 +1265,10 @@ def render_knowledge_base() -> None:
                             technology_tags=wechat_technology_tags.strip(),
                         )
                         if ok:
-                            st.success(f"已入库 {ok} 条公众号结果；其中抓取失败的条目会标记为候选线索，待人工补全文。")
+                            st.success(f"自动抓取并入库全文 {ok} 篇。")
+                            sync_kb_after_write()
+                        if stub_ok:
+                            st.warning(f"{stub_ok} 篇自动抓全文失败，已进入下方“待手动补全文队列”。")
                             sync_kb_after_write()
                         if errors:
                             st.error("\n".join(errors))
@@ -1011,6 +1286,23 @@ def render_knowledge_base() -> None:
                             st.session_state["wechat_candidates"] = [candidate.__dict__ for candidate in candidates]
                             if candidates:
                                 st.warning(f"搜狗搜索失败：{exc}。已切换冗余渠道找到 {len(candidates)} 条候选。")
+                                selected_indexes = list(range(min(wechat_ingest_count, len(candidates))))
+                                ok, stub_ok, errors = ingest_wechat_candidates(
+                                    st.session_state["wechat_candidates"],
+                                    selected_indexes,
+                                    keyword=wechat_keyword.strip(),
+                                    industry_tags=wechat_industry_tags.strip() or wechat_keyword.strip(),
+                                    company_tags=wechat_company_tags.strip(),
+                                    technology_tags=wechat_technology_tags.strip(),
+                                )
+                                if ok:
+                                    st.success(f"冗余渠道自动抓取并入库全文 {ok} 篇。")
+                                    sync_kb_after_write()
+                                if stub_ok:
+                                    st.warning(f"{stub_ok} 篇冗余候选自动抓全文失败，已进入下方“待手动补全文队列”。")
+                                    sync_kb_after_write()
+                                if errors:
+                                    st.error("\n".join(errors))
                             else:
                                 st.error(f"搜索失败且冗余渠道无结果：{exc}")
                         except Exception as redundant_exc:
@@ -1019,6 +1311,16 @@ def render_knowledge_base() -> None:
                     else:
                         st.session_state["wechat_candidates"] = []
                         st.error(f"搜索失败：{exc}")
+
+        st.markdown("#### 用浏览器验证状态补抓全文（实验）")
+        st.caption("可选：你先在浏览器里打开搜狗或微信并通过验证，然后把该页面请求的 Cookie 或 Copy as cURL 请求头粘到这里。工具会临时复用这些请求头补抓候选或失败队列；仍失败时继续使用上方采集书签。")
+        browser_state = st.text_area(
+            "浏览器 Cookie 或请求头",
+            value="",
+            placeholder="可粘贴 Cookie: xxx=yyy; ...，也可粘贴 Chrome DevTools 里的 Copy as cURL 片段。不会写入知识库。",
+            height=110,
+            key="wechat_browser_state",
+        )
 
         candidates = st.session_state.get("wechat_candidates", [])
         if candidates:
@@ -1047,8 +1349,8 @@ def render_knowledge_base() -> None:
                 key="wechat_candidate_editor",
             )
             if st.button("将当前勾选候选补充入库", use_container_width=True):
-                selected_indexes = [int(row["序号"]) - 1 for row in edited if row.get("选择")]
-                ok, errors = ingest_wechat_candidates(
+                selected_indexes = selected_indexes_from_editor(edited)
+                ok, stub_ok, errors = ingest_wechat_candidates(
                     candidates,
                     selected_indexes,
                     keyword=wechat_keyword.strip(),
@@ -1057,21 +1359,15 @@ def render_knowledge_base() -> None:
                     technology_tags=wechat_technology_tags.strip(),
                 )
                 if ok:
-                    st.success(f"成功补充入库 {ok} 条公众号结果；候选线索需人工补全文后才会作为报告证据。")
+                    st.success(f"成功补充入库公众号全文 {ok} 篇。")
+                    sync_kb_after_write()
+                if stub_ok:
+                    st.warning(f"{stub_ok} 篇仍未能抓全文，已进入下方“待手动补全文队列”。")
                     sync_kb_after_write()
                 if errors:
                     st.error("\n".join(errors))
-            st.markdown("#### 用浏览器验证状态补抓全文（实验）")
-            st.caption("参考豆包方案中“真实浏览器会话/点击”的思路：你先在浏览器里打开搜狗或微信并通过验证，然后把该页面请求的 Cookie 或 Copy as cURL 请求头粘到这里。工具会临时复用这些请求头补抓当前勾选候选；失败时继续使用上方采集书签。")
-            browser_state = st.text_area(
-                "浏览器 Cookie 或请求头",
-                value="",
-                placeholder="可粘贴 Cookie: xxx=yyy; ...，也可粘贴 Chrome DevTools 里的 Copy as cURL 片段。不会写入知识库。",
-                height=110,
-                key="wechat_browser_state",
-            )
             if st.button("用浏览器状态补抓当前勾选全文", use_container_width=True):
-                selected_indexes = [int(row["序号"]) - 1 for row in edited if row.get("选择")]
+                selected_indexes = selected_indexes_from_editor(edited)
                 ok, errors = ingest_wechat_candidates_with_browser_state(
                     candidates,
                     selected_indexes,
@@ -1086,6 +1382,14 @@ def render_knowledge_base() -> None:
                     sync_kb_after_write()
                 if errors:
                     st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
+
+        render_wechat_failed_queue(
+            keyword=wechat_keyword.strip(),
+            industry_tags=wechat_industry_tags.strip() or wechat_keyword.strip(),
+            company_tags=wechat_company_tags.strip(),
+            technology_tags=wechat_technology_tags.strip(),
+            browser_state=browser_state,
+        )
 
         if st.button("入库手动粘贴的微信文章链接", use_container_width=True):
             urls = [line.strip() for line in manual_wechat_urls.splitlines() if line.strip()]
@@ -1109,6 +1413,12 @@ def render_knowledge_base() -> None:
                                 search_rank=idx,
                             )
                             ok += 1
+                            remove_wechat_failed_candidate(
+                                url=article.url,
+                                title=article.title,
+                                account=article.account,
+                                other={"url": url, "title": article.title, "account": article.account},
+                            )
                             st.toast(f"已入库：{result['document'].get('title', article.title)}")
                         except Exception as exc:
                             errors.append(f"{url}: {exc}")
