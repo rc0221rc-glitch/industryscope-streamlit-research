@@ -4,6 +4,7 @@ import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import streamlit as st
 
@@ -46,6 +47,7 @@ from quark_ingest import (
 )
 from wechat_ingest import (
     WECHAT_COLLECTOR_BOOKMARKLET,
+    fetch_public_article,
     fetch_wechat_article,
     fetch_wechat_article_with_browser_state,
     ingest_wechat_article,
@@ -55,6 +57,7 @@ from wechat_ingest import (
     resolve_sogou_search_url,
     resolve_sogou_search_url_with_browser_state,
     search_sogou_wechat,
+    search_wechat_redundant_channels,
 )
 
 
@@ -497,15 +500,7 @@ def ingest_wechat_candidates(
             title = item.get("title", f"公众号文章 {candidate_index + 1}")
             try:
                 progress.progress(order / len(selected_indexes), text=f"正在处理：{title[:36]}")
-                article_url = resolve_sogou_search_url(item.get("search_url", ""))
-                if not article_url:
-                    raise RuntimeError("未能从搜狗跳转页解析真实微信文章链接。")
-                article = fetch_wechat_article(
-                    article_url,
-                    title_hint=title,
-                    account_hint=item.get("account", ""),
-                    date_hint=item.get("published_at", ""),
-                )
+                article = fetch_candidate_article(item, title)
                 result = ingest_wechat_article(
                     article,
                     keyword=keyword,
@@ -537,6 +532,55 @@ def ingest_wechat_candidates(
     return ok + stub_ok, errors
 
 
+def fetch_candidate_article(item: dict, title: str, browser_state: str = ""):
+    raw_url = item.get("url") or item.get("search_url") or ""
+    host = urlparse(raw_url).netloc.lower()
+    if "weixin.sogou.com" in host:
+        article_url = (
+            resolve_sogou_search_url_with_browser_state(raw_url, browser_state)
+            if browser_state
+            else resolve_sogou_search_url(raw_url)
+        )
+        if not article_url:
+            raise RuntimeError("未能从搜狗跳转页解析真实微信文章链接。")
+        return (
+            fetch_wechat_article_with_browser_state(
+                article_url,
+                browser_state=browser_state,
+                title_hint=title,
+                account_hint=item.get("account", ""),
+                date_hint=item.get("published_at", ""),
+            )
+            if browser_state
+            else fetch_wechat_article(
+                article_url,
+                title_hint=title,
+                account_hint=item.get("account", ""),
+                date_hint=item.get("published_at", ""),
+            )
+        )
+    if "mp.weixin.qq.com" in host:
+        return (
+            fetch_wechat_article_with_browser_state(
+                raw_url,
+                browser_state=browser_state,
+                title_hint=title,
+                account_hint=item.get("account", ""),
+                date_hint=item.get("published_at", ""),
+            )
+            if browser_state
+            else fetch_wechat_article(
+                raw_url,
+                title_hint=title,
+                account_hint=item.get("account", ""),
+                date_hint=item.get("published_at", ""),
+            )
+        )
+    if raw_url.startswith(("http://", "https://")):
+        return fetch_public_article(raw_url, title_hint=title, source_hint=item.get("account", ""))
+    raise RuntimeError("候选项没有可访问 URL。")
+
+
 def ingest_wechat_candidates_with_browser_state(
     candidates: list[dict],
     selected_indexes: list[int],
@@ -559,18 +603,7 @@ def ingest_wechat_candidates_with_browser_state(
             title = item.get("title", f"公众号文章 {candidate_index + 1}")
             try:
                 progress.progress(order / len(selected_indexes), text=f"正在补抓：{title[:36]}")
-                article_url = item.get("url") or ""
-                if not article_url:
-                    article_url = resolve_sogou_search_url_with_browser_state(item.get("search_url", ""), browser_state)
-                if not article_url:
-                    raise RuntimeError("未能解析真实微信文章链接。")
-                article = fetch_wechat_article_with_browser_state(
-                    article_url,
-                    browser_state=browser_state,
-                    title_hint=title,
-                    account_hint=item.get("account", ""),
-                    date_hint=item.get("published_at", ""),
-                )
+                article = fetch_candidate_article(item, title, browser_state=browser_state)
                 result = ingest_wechat_article(
                     article,
                     keyword=keyword or article.title,
@@ -825,6 +858,13 @@ def render_knowledge_base() -> None:
             wechat_candidate_count = st.slider("候选篇数", 5, 30, 10, step=1)
         with col_w3:
             wechat_ingest_count = st.slider("默认入库最近篇数", 1, 20, 5, step=1)
+        col_sched1, col_sched2, col_sched3 = st.columns(3)
+        with col_sched1:
+            wechat_cache_ttl = st.slider("搜索缓存天数", 0, 7, 1, step=1, help="同一关键词在缓存期内不重复请求搜狗/备用搜索。0 表示不使用缓存。")
+        with col_sched2:
+            wechat_delay = st.slider("请求间隔秒", 1.0, 5.0, 2.5, step=0.5, help="降低触发搜狗校验的概率。")
+        with col_sched3:
+            wechat_redundant = st.toggle("启用冗余渠道", value=True, help="搜狗失败或结果不足时，补充微信原文、转载页、纪要和机构观点候选。")
         col_tag1, col_tag2, col_tag3 = st.columns(3)
         with col_tag1:
             wechat_industry_tags = st.text_input("公众号入库行业标签", value="", placeholder="默认使用搜索关键词")
@@ -909,7 +949,28 @@ def render_knowledge_base() -> None:
             else:
                 try:
                     with st.spinner("正在通过搜狗微信搜索公众号文章..."):
-                        candidates = search_sogou_wechat(wechat_keyword.strip(), limit=wechat_candidate_count, pages=4)
+                        candidates = search_sogou_wechat(
+                            wechat_keyword.strip(),
+                            limit=wechat_candidate_count,
+                            pages=4,
+                            cache_ttl_days=int(wechat_cache_ttl),
+                            min_delay_seconds=float(wechat_delay),
+                        )
+                    if wechat_redundant and len(candidates) < wechat_candidate_count:
+                        with st.spinner("正在补充冗余渠道候选..."):
+                            redundant = search_wechat_redundant_channels(
+                                wechat_keyword.strip(),
+                                limit=wechat_candidate_count,
+                                cache_ttl_days=int(wechat_cache_ttl),
+                            )
+                        seen_urls = {item.search_url or item.url for item in candidates}
+                        for item in redundant:
+                            key = item.search_url or item.url
+                            if key not in seen_urls:
+                                candidates.append(item)
+                                seen_urls.add(key)
+                            if len(candidates) >= wechat_candidate_count:
+                                break
                     st.session_state["wechat_candidates"] = [candidate.__dict__ for candidate in candidates]
                     if candidates:
                         st.success(f"找到 {len(candidates)} 条候选。日期无法识别的文章会保留搜索排序。")
@@ -930,8 +991,25 @@ def render_knowledge_base() -> None:
                     else:
                         st.warning("没有找到候选文章。可以换更具体的关键词，或稍后重试。")
                 except Exception as exc:
-                    st.session_state["wechat_candidates"] = []
-                    st.error(f"搜索失败：{exc}")
+                    if wechat_redundant:
+                        try:
+                            with st.spinner("搜狗触发校验或失败，正在切换冗余渠道..."):
+                                candidates = search_wechat_redundant_channels(
+                                    wechat_keyword.strip(),
+                                    limit=wechat_candidate_count,
+                                    cache_ttl_days=int(wechat_cache_ttl),
+                                )
+                            st.session_state["wechat_candidates"] = [candidate.__dict__ for candidate in candidates]
+                            if candidates:
+                                st.warning(f"搜狗搜索失败：{exc}。已切换冗余渠道找到 {len(candidates)} 条候选。")
+                            else:
+                                st.error(f"搜索失败且冗余渠道无结果：{exc}")
+                        except Exception as redundant_exc:
+                            st.session_state["wechat_candidates"] = []
+                            st.error(f"搜索失败：{exc}；冗余渠道也失败：{redundant_exc}")
+                    else:
+                        st.session_state["wechat_candidates"] = []
+                        st.error(f"搜索失败：{exc}")
 
         candidates = st.session_state.get("wechat_candidates", [])
         if candidates:

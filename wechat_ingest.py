@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
+import os
 import re
 import tempfile
 import time
 from dataclasses import dataclass, asdict, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -18,6 +20,9 @@ from knowledge_base import WECHAT_CANDIDATE_SOURCE_TYPE, add_document, filename_
 
 
 SOGOU_WECHAT_URL = "https://weixin.sogou.com/weixin"
+WECHAT_CACHE_DIR = Path(os.getenv("INDUSTRYSCOPE_WECHAT_CACHE_DIR", "data/wechat_cache"))
+SEARCH_CACHE_DIR = WECHAT_CACHE_DIR / "search"
+ARTICLE_CACHE_DIR = WECHAT_CACHE_DIR / "article"
 WECHAT_COLLECTOR_BOOKMARKLET = '''javascript:(async()=>{const T=s=>(s||"").replace(/\\s+/g," ").trim(),Q=s=>document.querySelector(s),C=Q("#js_content")||Q(".rich_media_content")||document.body,I=[...C.querySelectorAll("img")].map((m,i)=>({index:i+1,src:m.getAttribute("data-src")||m.currentSrc||m.src||"",alt:T(m.alt||m.getAttribute("data-type")||""),nearby:T((m.closest("p,section,figure")||m.parentElement||{}).innerText||"").slice(0,240)})).filter(x=>x.src),P={source:"IndustryScopeWeChatClip",version:1,captured_at:new Date().toISOString(),title:T((Q("#activity-name")||Q("h1")||{}).innerText),url:location.href,account:T((Q("#js_name")||Q(".profile_nickname")||{}).innerText),published_at:T((Q("#publish_time")||{}).innerText),content:(C.innerText||"").trim(),images:I};const S=JSON.stringify(P);try{await navigator.clipboard.writeText(S)}catch(e){const a=document.createElement("textarea");a.value=S;document.body.appendChild(a);a.select();document.execCommand("copy");a.remove()}alert("已复制到剪贴板：回到 IndustryScope 粘贴并入库。图片链接 "+I.length+" 个。");try{window.opener&&window.opener.focus();setTimeout(()=>window.close(),300)}catch(e){}})()'''
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0 Safari/537.36",
@@ -70,6 +75,65 @@ def clean_text(text: str) -> str:
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def ensure_wechat_cache_dirs() -> None:
+    SEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    ARTICLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def cache_key(value: str) -> str:
+    return hashlib.sha256((value or "").encode("utf-8")).hexdigest()[:24]
+
+
+def cache_path(cache_dir: Path, key: str) -> Path:
+    ensure_wechat_cache_dirs()
+    return cache_dir / f"{key}.json"
+
+
+def read_cache(path: Path, ttl_days: int) -> Any | None:
+    if ttl_days <= 0 or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        cached_at = datetime.fromisoformat(data.get("_cached_at", ""))
+        if datetime.now() - cached_at > timedelta(days=ttl_days):
+            return None
+        return data.get("payload")
+    except Exception:
+        return None
+
+
+def write_cache(path: Path, payload: Any) -> None:
+    ensure_wechat_cache_dirs()
+    data = {"_cached_at": datetime.now().isoformat(timespec="seconds"), "payload": payload}
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def request_with_backoff(
+    session: requests.Session,
+    url: str,
+    *,
+    params: dict[str, str] | None = None,
+    timeout: int = 12,
+    allow_redirects: bool = True,
+    max_retries: int = 3,
+    base_delay: float = 2.0,
+) -> requests.Response:
+    last_exc: Exception | None = None
+    for attempt in range(max(1, max_retries)):
+        try:
+            response = session.get(url, params=params, timeout=timeout, allow_redirects=allow_redirects)
+            if response.status_code not in {429, 500, 502, 503, 504}:
+                return response
+            last_exc = RuntimeError(f"HTTP {response.status_code}")
+        except requests.RequestException as exc:
+            last_exc = exc
+        if attempt < max_retries - 1:
+            time.sleep(min(20.0, base_delay * (2 ** attempt)))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("请求失败。")
 
 
 def timestamp_to_date(value: str) -> tuple[str, int]:
@@ -156,13 +220,142 @@ def make_browser_state_session(browser_state: str = "") -> requests.Session:
     return session
 
 
+def unwrap_search_url(url: str) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if "duckduckgo.com" in parsed.netloc and parsed.query:
+        match = re.search(r"[?&]uddg=([^&]+)", url)
+        if match:
+            from urllib.parse import unquote
+
+            return unquote(match.group(1))
+    return url
+
+
+def search_duckduckgo_html(query: str, limit: int = 8) -> list[dict[str, str]]:
+    session = make_sogou_session()
+    response = request_with_backoff(
+        session,
+        "https://duckduckgo.com/html/",
+        params={"q": query},
+        timeout=10,
+        allow_redirects=True,
+        max_retries=2,
+        base_delay=2.0,
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    items: list[dict[str, str]] = []
+    for result in soup.select(".result")[:limit]:
+        link = result.select_one("a.result__a")
+        snippet = result.select_one(".result__snippet")
+        if not link:
+            continue
+        items.append({
+            "title": normalize_space(link.get_text(" ", strip=True)),
+            "url": unwrap_search_url(link.get("href", "")),
+            "snippet": normalize_space(snippet.get_text(" ", strip=True) if snippet else ""),
+        })
+    return items
+
+
+def search_bing_html(query: str, limit: int = 8) -> list[dict[str, str]]:
+    session = make_sogou_session()
+    response = request_with_backoff(
+        session,
+        "https://www.bing.com/search",
+        params={"q": query},
+        timeout=10,
+        allow_redirects=True,
+        max_retries=2,
+        base_delay=2.0,
+    )
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "html.parser")
+    items: list[dict[str, str]] = []
+    for result in soup.select("li.b_algo")[:limit]:
+        link = result.select_one("h2 a") or result.select_one("a")
+        snippet = result.select_one(".b_caption p") or result.select_one("p")
+        if not link:
+            continue
+        items.append({
+            "title": normalize_space(link.get_text(" ", strip=True)),
+            "url": unwrap_search_url(link.get("href", "")),
+            "snippet": normalize_space(snippet.get_text(" ", strip=True) if snippet else ""),
+        })
+    return items
+
+
+def search_wechat_redundant_channels(keyword: str, limit: int = 10, cache_ttl_days: int = 1) -> list[WechatSearchResult]:
+    cache_file = cache_path(SEARCH_CACHE_DIR, cache_key(f"redundant|{keyword}|{limit}"))
+    cached = read_cache(cache_file, cache_ttl_days)
+    if cached:
+        return [WechatSearchResult(**item) for item in cached]
+
+    queries = [
+        f'{keyword} 微信公众号 转载 OR 原文',
+        f'{keyword} 公众号 调研纪要 OR 专家纪要',
+        f'{keyword} site:mp.weixin.qq.com',
+        f'{keyword} 百家号 知乎 头条 转载',
+        f'{keyword} 券商研报 基金公司 观点',
+    ]
+    results: list[WechatSearchResult] = []
+    seen: set[str] = set()
+    rank = 0
+    for query in queries:
+        search_items: list[dict[str, str]] = []
+        for searcher in (search_duckduckgo_html, search_bing_html):
+            try:
+                search_items.extend(searcher(query, limit=6))
+            except Exception:
+                continue
+            time.sleep(1.0)
+        for item in search_items:
+            url = item.get("url", "").strip()
+            title = item.get("title", "").strip()
+            if not url.startswith(("http://", "https://")) or not title:
+                continue
+            dedupe = url.split("#", 1)[0]
+            if dedupe in seen:
+                continue
+            seen.add(dedupe)
+            rank += 1
+            host = urlparse(url).netloc.lower().removeprefix("www.")
+            status = "冗余候选"
+            if "mp.weixin.qq.com" in host:
+                status = "微信原文候选"
+            elif any(domain in host for domain in ["baijiahao.baidu.com", "zhihu.com", "toutiao.com"]):
+                status = "转载候选"
+            elif any(token in title for token in ["研报", "纪要", "调研", "基金", "券商"]):
+                status = "机构/纪要候选"
+            results.append(
+                WechatSearchResult(
+                    title=title,
+                    search_url=url,
+                    url=url,
+                    account=host,
+                    published_at="",
+                    published_ts=0,
+                    snippet=item.get("snippet", ""),
+                    rank=rank,
+                    status=status,
+                )
+            )
+            if len(results) >= limit:
+                write_cache(cache_file, [asdict(result) for result in results])
+                return results
+    write_cache(cache_file, [asdict(result) for result in results])
+    return results
+
+
 def resolve_sogou_link(session: requests.Session, url: str, timeout: int = 15) -> str:
     if not url:
         return ""
     absolute = urljoin("https://weixin.sogou.com", url)
     if "mp.weixin.qq.com" in urlparse(absolute).netloc:
         return absolute
-    response = session.get(absolute, timeout=timeout, allow_redirects=True)
+    response = request_with_backoff(session, absolute, timeout=timeout, allow_redirects=True, max_retries=3, base_delay=2.0)
     response.raise_for_status()
     if "antispider" in response.url or "请输入验证码" in response.text or "verify_page" in response.text:
         raise RuntimeError("搜狗微信跳转页触发验证码/反爬验证，无法自动解析真实微信链接。请稍后重试，或手动打开候选文章后复制 mp.weixin.qq.com 链接入库。")
@@ -174,14 +367,26 @@ def resolve_sogou_link(session: requests.Session, url: str, timeout: int = 15) -
     return resolved
 
 
-def search_sogou_wechat(keyword: str, limit: int = 10, pages: int = 3) -> list[WechatSearchResult]:
+def search_sogou_wechat(
+    keyword: str,
+    limit: int = 10,
+    pages: int = 3,
+    cache_ttl_days: int = 1,
+    min_delay_seconds: float = 2.0,
+) -> list[WechatSearchResult]:
+    cache_file = cache_path(SEARCH_CACHE_DIR, cache_key(f"{keyword}|{limit}|{pages}"))
+    cached = read_cache(cache_file, cache_ttl_days)
+    if cached:
+        return [WechatSearchResult(**item) for item in cached]
+
     session = make_sogou_session()
     results: list[WechatSearchResult] = []
     seen: set[str] = set()
     rank = 0
 
     for page in range(1, max(1, pages) + 1):
-        response = session.get(
+        response = request_with_backoff(
+            session,
             SOGOU_WECHAT_URL,
             params={
                 "type": "2",
@@ -193,6 +398,9 @@ def search_sogou_wechat(keyword: str, limit: int = 10, pages: int = 3) -> list[W
                 "page": str(page),
             },
             timeout=12,
+            allow_redirects=True,
+            max_retries=3,
+            base_delay=max(2.0, min_delay_seconds),
         )
         response.raise_for_status()
         if "请输入验证码" in response.text or "antispider" in response.url or "antispider" in response.text:
@@ -232,10 +440,12 @@ def search_sogou_wechat(keyword: str, limit: int = 10, pages: int = 3) -> list[W
             )
         if len(results) >= limit:
             break
-        time.sleep(0.6)
+        time.sleep(max(1.0, min_delay_seconds))
 
     results = sorted(results, key=lambda item: (item.published_ts, -item.rank), reverse=True)
-    return results[:limit]
+    results = results[:limit]
+    write_cache(cache_file, [asdict(item) for item in results])
+    return results
 
 
 def resolve_sogou_search_url(search_url: str) -> str:
@@ -255,8 +465,13 @@ def fetch_wechat_article(
     date_hint: str = "",
     browser_state: str = "",
 ) -> WechatArticle:
+    cache_file = cache_path(ARTICLE_CACHE_DIR, cache_key(url))
+    cached = read_cache(cache_file, ttl_days=7)
+    if cached:
+        return WechatArticle(**cached)
+
     session = make_browser_state_session(browser_state)
-    response = session.get(url, timeout=18)
+    response = request_with_backoff(session, url, timeout=18, allow_redirects=True, max_retries=3, base_delay=2.0)
     response.raise_for_status()
     if "环境异常" in response.text or "访问过于频繁" in response.text or "验证码" in response.text:
         raise RuntimeError("微信文章页返回环境/频率验证，无法公开抓取正文。")
@@ -271,7 +486,7 @@ def fetch_wechat_article(
     images = extract_wechat_images_from_soup(content_node)
     if len(content) < 120:
         raise RuntimeError("未能抽取到足够长的公众号正文，可能是链接过期、需要校验或页面结构变化。")
-    return WechatArticle(
+    article = WechatArticle(
         title=normalize_space(title_node.get_text(" ", strip=True) if title_node else title_hint),
         url=url,
         account=normalize_space(account_node.get_text(" ", strip=True) if account_node else account_hint),
@@ -280,6 +495,8 @@ def fetch_wechat_article(
         images=images,
         html_title=normalize_space(soup.title.get_text(" ", strip=True) if soup.title else ""),
     )
+    write_cache(cache_file, asdict(article))
+    return article
 
 
 def fetch_wechat_article_with_browser_state(
@@ -296,6 +513,57 @@ def fetch_wechat_article_with_browser_state(
         date_hint=date_hint,
         browser_state=browser_state,
     )
+
+
+def fetch_public_article(url: str, title_hint: str = "", source_hint: str = "") -> WechatArticle:
+    cache_file = cache_path(ARTICLE_CACHE_DIR, cache_key(f"public|{url}"))
+    cached = read_cache(cache_file, ttl_days=7)
+    if cached:
+        return WechatArticle(**cached)
+    session = make_sogou_session()
+    response = request_with_backoff(session, url, timeout=15, allow_redirects=True, max_retries=2, base_delay=2.0)
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "")
+    if "text/html" not in content_type and "text/plain" not in content_type:
+        raise RuntimeError(f"转载页不是可抽取文本页面：{content_type or 'unknown content-type'}")
+    if not response.encoding or response.encoding.lower() in {"iso-8859-1", "ascii"}:
+        response.encoding = response.apparent_encoding or "utf-8"
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style", "noscript", "iframe", "svg", "nav", "footer", "header", "aside", "form"]):
+        tag.decompose()
+    title_node = soup.select_one("h1") or soup.select_one("title")
+    content_node = None
+    for selector in [
+        "article",
+        "main",
+        ".article-content",
+        ".article__content",
+        ".article-body",
+        ".post-content",
+        ".entry-content",
+        ".content",
+        ".main-content",
+        "body",
+    ]:
+        node = soup.select_one(selector)
+        if node and len(clean_text(node.get_text("\n", strip=True))) >= 120:
+            content_node = node
+            break
+    content = clean_text(content_node.get_text("\n", strip=True) if content_node else "")
+    if len(content) < 300:
+        raise RuntimeError("未能从转载/备用页面抽取足够正文。")
+    images = extract_wechat_images_from_soup(content_node)
+    article = WechatArticle(
+        title=normalize_space(title_node.get_text(" ", strip=True) if title_node else title_hint),
+        url=url,
+        account=source_hint or urlparse(url).netloc.lower().removeprefix("www."),
+        published_at="",
+        content=content,
+        images=images,
+        html_title=normalize_space(soup.title.get_text(" ", strip=True) if soup.title else ""),
+    )
+    write_cache(cache_file, asdict(article))
+    return article
 
 
 def extract_wechat_images_from_soup(content_node: Any) -> list[dict[str, str]]:
