@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 import tempfile
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from knowledge_base import WECHAT_CANDIDATE_SOURCE_TYPE, add_document, filename_
 
 
 SOGOU_WECHAT_URL = "https://weixin.sogou.com/weixin"
+WECHAT_COLLECTOR_BOOKMARKLET = '''javascript:(async()=>{const T=s=>(s||"").replace(/\\s+/g," ").trim(),Q=s=>document.querySelector(s),C=Q("#js_content")||Q(".rich_media_content")||document.body,I=[...C.querySelectorAll("img")].map((m,i)=>({index:i+1,src:m.getAttribute("data-src")||m.currentSrc||m.src||"",alt:T(m.alt||m.getAttribute("data-type")||""),nearby:T((m.closest("p,section,figure")||m.parentElement||{}).innerText||"").slice(0,240)})).filter(x=>x.src),P={source:"IndustryScopeWeChatClip",version:1,captured_at:new Date().toISOString(),title:T((Q("#activity-name")||Q("h1")||{}).innerText),url:location.href,account:T((Q("#js_name")||Q(".profile_nickname")||{}).innerText),published_at:T((Q("#publish_time")||{}).innerText),content:(C.innerText||"").trim(),images:I};const S=JSON.stringify(P);try{await navigator.clipboard.writeText(S)}catch(e){const a=document.createElement("textarea");a.value=S;document.body.appendChild(a);a.select();document.execCommand("copy");a.remove()}alert("已复制到剪贴板：回到 IndustryScope 粘贴并入库。图片链接 "+I.length+" 个。");try{window.opener&&window.opener.focus();setTimeout(()=>window.close(),300)}catch(e){}})()'''
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.7",
@@ -47,6 +49,7 @@ class WechatArticle:
     published_at: str
     content: str
     html_title: str = ""
+    images: list[dict[str, str]] = field(default_factory=list)
 
 
 def normalize_space(text: str) -> str:
@@ -208,6 +211,7 @@ def fetch_wechat_article(url: str, title_hint: str = "", account_hint: str = "",
     date_node = soup.select_one("#publish_time")
     content_node = soup.select_one("#js_content") or soup.select_one(".rich_media_content")
     content = clean_text(content_node.get_text("\n", strip=True) if content_node else "")
+    images = extract_wechat_images_from_soup(content_node)
     if len(content) < 120:
         raise RuntimeError("未能抽取到足够长的公众号正文，可能是链接过期、需要校验或页面结构变化。")
     return WechatArticle(
@@ -216,8 +220,53 @@ def fetch_wechat_article(url: str, title_hint: str = "", account_hint: str = "",
         account=normalize_space(account_node.get_text(" ", strip=True) if account_node else account_hint),
         published_at=normalize_space(date_node.get_text(" ", strip=True) if date_node else date_hint),
         content=content,
+        images=images,
         html_title=normalize_space(soup.title.get_text(" ", strip=True) if soup.title else ""),
     )
+
+
+def extract_wechat_images_from_soup(content_node: Any) -> list[dict[str, str]]:
+    if content_node is None:
+        return []
+    images: list[dict[str, str]] = []
+    for idx, image in enumerate(content_node.select("img"), start=1):
+        src = image.get("data-src") or image.get("src") or image.get("data-original") or ""
+        if not src:
+            continue
+        parent_text = normalize_space((image.find_parent(["p", "section", "figure"]) or image.parent).get_text(" ", strip=True) if image.parent else "")
+        images.append({
+            "index": str(idx),
+            "src": src,
+            "alt": normalize_space(image.get("alt") or image.get("data-type") or ""),
+            "nearby": parent_text[:240],
+        })
+    return images[:80]
+
+
+def image_catalog_markdown(images: list[dict[str, Any]]) -> str:
+    if not images:
+        return ""
+    lines = [
+        "",
+        "## 图片与图表线索",
+        "",
+        "以下图片 URL 来自公众号正文页面，仅作为图表/配图线索保存；模型使用图片中的数字或图表结论前，仍需人工核验图片内容或另找文字来源。",
+        "",
+    ]
+    for item in images[:80]:
+        src = str(item.get("src") or "").strip()
+        if not src:
+            continue
+        index = item.get("index") or len(lines)
+        alt = normalize_space(str(item.get("alt") or ""))
+        nearby = normalize_space(str(item.get("nearby") or ""))
+        lines.append(f"- 图{index}：{src}")
+        if alt:
+            lines.append(f"  - alt：{alt}")
+        if nearby:
+            lines.append(f"  - 附近文字：{nearby}")
+        lines.append(f"  - 预览：![图{index}]({src})")
+    return "\n".join(lines)
 
 
 def article_to_markdown(article: WechatArticle, keyword: str, search_rank: int = 0) -> str:
@@ -236,6 +285,7 @@ def article_to_markdown(article: WechatArticle, keyword: str, search_rank: int =
             "## 正文",
             "",
             article.content,
+            image_catalog_markdown(article.images),
             "",
         ]
     )
@@ -311,6 +361,7 @@ def ingest_wechat_fulltext(
     industry_tags: str = "",
     company_tags: str = "",
     technology_tags: str = "",
+    images: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     cleaned_content = clean_text(content)
     if len(cleaned_content) < 120:
@@ -321,6 +372,7 @@ def ingest_wechat_fulltext(
         account=normalize_space(account),
         published_at=normalize_space(published_at),
         content=cleaned_content,
+        images=images or [],
     )
     return ingest_wechat_article(
         article,
@@ -330,6 +382,70 @@ def ingest_wechat_fulltext(
         technology_tags=technology_tags,
         search_rank=0,
     )
+
+
+def parse_wechat_clip_payload(payload: str) -> dict[str, Any]:
+    text = (payload or "").strip()
+    if not text:
+        raise RuntimeError("请先粘贴公众号采集 JSON。")
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("采集内容不是有效 JSON。请确认使用的是 IndustryScope 公众号采集书签，并完整粘贴剪贴板内容。") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("采集 JSON 格式不正确。")
+    content = clean_text(str(data.get("content") or ""))
+    if len(content) < 120:
+        raise RuntimeError("采集到的正文太短，可能还停留在验证页或未打开正文页。请通过验证后在文章正文页再次点击采集书签。")
+    images = data.get("images") or []
+    if not isinstance(images, list):
+        images = []
+    clean_images: list[dict[str, str]] = []
+    for idx, item in enumerate(images[:80], start=1):
+        if not isinstance(item, dict):
+            continue
+        src = str(item.get("src") or "").strip()
+        if not src:
+            continue
+        clean_images.append({
+            "index": str(item.get("index") or idx),
+            "src": src,
+            "alt": normalize_space(str(item.get("alt") or "")),
+            "nearby": normalize_space(str(item.get("nearby") or ""))[:240],
+        })
+    return {
+        "title": normalize_space(str(data.get("title") or "")),
+        "url": normalize_space(str(data.get("url") or "")),
+        "account": normalize_space(str(data.get("account") or "")),
+        "published_at": normalize_space(str(data.get("published_at") or "")),
+        "content": content,
+        "images": clean_images,
+        "captured_at": normalize_space(str(data.get("captured_at") or "")),
+    }
+
+
+def ingest_wechat_clip_payload(
+    payload: str,
+    keyword: str = "",
+    industry_tags: str = "",
+    company_tags: str = "",
+    technology_tags: str = "",
+) -> dict[str, Any]:
+    data = parse_wechat_clip_payload(payload)
+    result = ingest_wechat_fulltext(
+        title=data.get("title") or "公众号采集正文",
+        content=data.get("content", ""),
+        url=data.get("url", ""),
+        account=data.get("account", ""),
+        published_at=data.get("published_at", ""),
+        keyword=keyword or data.get("title", ""),
+        industry_tags=industry_tags or keyword or data.get("title", ""),
+        company_tags=company_tags,
+        technology_tags=technology_tags,
+        images=data.get("images", []),
+    )
+    result["clip"] = data
+    return result
 
 
 def ingest_wechat_article(

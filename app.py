@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -44,9 +45,11 @@ from quark_ingest import (
     scan_quark_share,
 )
 from wechat_ingest import (
+    WECHAT_COLLECTOR_BOOKMARKLET,
     fetch_wechat_article,
     ingest_wechat_article,
     ingest_wechat_candidate_stub,
+    ingest_wechat_clip_payload,
     ingest_wechat_fulltext,
     resolve_sogou_search_url,
     search_sogou_wechat,
@@ -78,6 +81,69 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+def render_wechat_quick_open_panel(candidates: list[dict]) -> None:
+    items = [
+        {
+            "title": item.get("title") or f"候选文章 {idx}",
+            "url": item.get("url") or item.get("search_url") or "",
+            "account": item.get("account") or "",
+            "date": item.get("published_at") or "",
+        }
+        for idx, item in enumerate(candidates, start=1)
+        if item.get("url") or item.get("search_url")
+    ]
+    if not items:
+        return
+    payload = (
+        json.dumps(items[:30], ensure_ascii=False)
+        .replace("</", "<\\/")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+    st.components.v1.html(
+        f"""
+        <div id="wechat-open-panel" style="font-family: system-ui, -apple-system, Segoe UI, sans-serif;">
+          <div style="display:flex;gap:8px;align-items:center;margin:4px 0 8px;">
+            <strong style="font-size:14px;">快速打开验证窗口</strong>
+            <span style="font-size:12px;color:#667085;">通过验证后点击采集书签，浏览器允许时会自动关闭文章页。</span>
+          </div>
+          <div id="wechat-open-list" style="display:grid;gap:6px;"></div>
+        </div>
+        <script>
+          const items = {payload};
+          const root = document.getElementById("wechat-open-list");
+          items.forEach((item, index) => {{
+            const row = document.createElement("div");
+            row.style.display = "grid";
+            row.style.gridTemplateColumns = "92px minmax(0, 1fr)";
+            row.style.gap = "8px";
+            row.style.alignItems = "center";
+            const button = document.createElement("button");
+            button.textContent = "打开文章";
+            button.style.height = "30px";
+            button.style.border = "1px solid #cfd7cf";
+            button.style.borderRadius = "6px";
+            button.style.background = "#fff";
+            button.style.cursor = "pointer";
+            button.onclick = () => window.open(item.url, "industryscope_wechat_" + index, "popup=yes,width=1180,height=900,left=80,top=40");
+            const meta = document.createElement("div");
+            meta.style.minWidth = "0";
+            meta.style.fontSize = "13px";
+            meta.style.whiteSpace = "nowrap";
+            meta.style.overflow = "hidden";
+            meta.style.textOverflow = "ellipsis";
+            meta.textContent = item.title + (item.account ? " · " + item.account : "") + (item.date ? " · " + item.date : "");
+            row.appendChild(button);
+            row.appendChild(meta);
+            root.appendChild(row);
+          }});
+        </script>
+        """,
+        height=min(260, 46 + len(items[:30]) * 38),
+        scrolling=True,
+    )
 
 
 PROVIDER_PRESETS = {
@@ -719,8 +785,38 @@ def render_knowledge_base() -> None:
             placeholder="每行一个 mp.weixin.qq.com 链接。用于搜狗跳转触发验证码时的稳定备用入口。",
             height=68,
         )
+        st.markdown("#### 半自动采集入库")
+        st.caption("推荐流程：先把下面脚本保存成浏览器书签；从候选列表打开文章，通过验证后点击该书签；它会复制正文和图片链接，必要时自动关闭文章页；回到这里粘贴并入库。")
+        with st.popover("安装公众号采集书签"):
+            st.markdown("1. 新建一个浏览器书签，名称可写 `IndustryScope采集`。")
+            st.markdown("2. 把下面整段脚本复制到书签的网址/URL。")
+            st.markdown("3. 打开公众号正文页并通过验证后，点击这个书签即可复制采集 JSON。")
+            st.text_area("书签网址脚本", value=WECHAT_COLLECTOR_BOOKMARKLET, height=180, key="wechat_bookmarklet_code")
+        clip_payload = st.text_area(
+            "粘贴采集 JSON",
+            value="",
+            placeholder="在微信正文页点击 IndustryScope采集 书签后，回到这里 Ctrl+V。",
+            height=140,
+            key="wechat_clip_payload",
+        )
+        if st.button("入库采集到的公众号正文", use_container_width=True):
+            try:
+                result = ingest_wechat_clip_payload(
+                    clip_payload,
+                    keyword=wechat_keyword.strip(),
+                    industry_tags=wechat_industry_tags.strip() or wechat_keyword.strip(),
+                    company_tags=wechat_company_tags.strip(),
+                    technology_tags=wechat_technology_tags.strip(),
+                )
+                clip = result.get("clip", {})
+                image_count = len(clip.get("images", [])) if isinstance(clip, dict) else 0
+                st.success(f"已入库采集正文：{result['document'].get('title', '未命名文章')}；图片/图表线索 {image_count} 个。")
+                sync_kb_after_write()
+            except Exception as exc:
+                st.error(f"采集正文入库失败：{exc}")
+
         st.markdown("#### 手动粘贴公众号全文入库")
-        st.caption("如果搜狗或微信触发图片验证，请在浏览器里人工打开文章并复制正文。这里粘贴的全文会作为真正的知识库证据；只保存候选链接的条目不会支撑报告强结论。")
+        st.caption("备用流程：如果不想使用采集书签，也可以手动复制正文。这里粘贴的全文会作为真正的知识库证据；只保存候选链接的条目不会支撑报告强结论。")
         manual_full_title = st.text_input("文章标题", value="", key="manual_wechat_full_title")
         col_full1, col_full2 = st.columns(2)
         with col_full1:
@@ -786,21 +882,28 @@ def render_knowledge_base() -> None:
 
         candidates = st.session_state.get("wechat_candidates", [])
         if candidates:
+            render_wechat_quick_open_panel(candidates)
             rows = []
             for idx, item in enumerate(candidates, start=1):
                 rows.append({
                     "选择": idx <= wechat_ingest_count,
                     "序号": idx,
                     "标题": item.get("title", ""),
+                    "打开": item.get("url") or item.get("search_url", ""),
                     "公众号": item.get("account", ""),
                     "日期": item.get("published_at", "") or "未识别",
+                    "状态": item.get("status", "候选"),
                     "摘要": item.get("snippet", ""),
                 })
             edited = st.data_editor(
                 rows,
                 use_container_width=True,
                 hide_index=True,
-                disabled=["序号", "标题", "公众号", "日期", "摘要"],
+                disabled=["序号", "标题", "打开", "公众号", "日期", "状态", "摘要"],
+                column_config={
+                    "打开": st.column_config.LinkColumn("打开", display_text="打开文章"),
+                    "摘要": st.column_config.TextColumn("摘要", width="large"),
+                },
                 key="wechat_candidate_editor",
             )
             if st.button("将当前勾选候选补充入库", use_container_width=True):
