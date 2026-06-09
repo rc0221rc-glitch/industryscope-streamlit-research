@@ -473,49 +473,6 @@ def render_knowledge_base() -> None:
     c4.metric("远端持久化", "已启用" if stats["remote_sync"] else "未配置")
     st.caption(f"本地缓存目录：{stats['root']}。Streamlit Cloud 本地磁盘可能在重启/重新部署后丢失；建议使用下方快照备份，或配置 S3/R2 远端持久化。")
 
-    with st.expander("知识库备份、恢复与远端持久化", expanded=not stats["remote_sync"]):
-        st.caption("快照 ZIP 包含知识库索引、文本片段和原始上传文件。它是防止 Streamlit 重启后丢失知识库的最低成本保险。")
-        snap_col1, snap_col2 = st.columns(2)
-        with snap_col1:
-            st.download_button(
-                "下载知识库完整快照 ZIP",
-                data=export_kb_snapshot_bytes(),
-                file_name=f"industryscope_kb_snapshot_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
-        with snap_col2:
-            if st.button("立即同步到远端 S3/R2", use_container_width=True, disabled=not s3_sync_enabled()):
-                try:
-                    st.success(upload_kb_snapshot_to_s3())
-                except Exception as exc:
-                    st.error(f"远端同步失败：{exc}")
-
-        restore_file = st.file_uploader("从快照 ZIP 恢复知识库", type=["zip"], key="kb_snapshot_restore")
-        restore_mode = st.radio("恢复模式", ["合并到当前知识库", "替换当前知识库"], horizontal=True)
-        restore_col1, restore_col2 = st.columns(2)
-        with restore_col1:
-            if st.button("导入快照 ZIP", use_container_width=True):
-                if not restore_file:
-                    st.error("请先选择快照 ZIP。")
-                else:
-                    try:
-                        result = import_kb_snapshot_bytes(
-                            restore_file.getvalue(),
-                            merge=restore_mode == "合并到当前知识库",
-                        )
-                        sync_kb_after_write()
-                        st.success(f"已恢复 {result['documents']} 个文档、{result['chunks']} 个片段。")
-                    except Exception as exc:
-                        st.error(f"恢复失败：{exc}")
-        with restore_col2:
-            if st.button("从远端 S3/R2 恢复", use_container_width=True, disabled=not s3_sync_enabled()):
-                try:
-                    result = restore_kb_snapshot_from_s3(merge=restore_mode == "合并到当前知识库")
-                    st.success(f"已从 {result.get('remote')} 恢复 {result['documents']} 个文档、{result['chunks']} 个片段。")
-                except Exception as exc:
-                    st.error(f"远端恢复失败：{exc}")
-
     with st.expander("上传并入库", expanded=True):
         st.caption("建议分批上传：每批不超过 20 个文件、单文件不超过 100-200MB。Streamlit 会先把上传文件放入内存，超大批量可能导致应用重启。")
         uploaded = st.file_uploader(
@@ -572,6 +529,53 @@ def render_knowledge_base() -> None:
                     sync_kb_after_write()
                 if errors:
                     st.error("\n".join(errors))
+
+    with st.expander("知识库备份、恢复与远端持久化", expanded=False):
+        st.caption("这里不是普通文档上传入口。快照 ZIP 用于整库备份/恢复；普通 PDF、DOCX、TXT 等请使用上方“上传并入库”。")
+        snap_col1, snap_col2 = st.columns(2)
+        with snap_col1:
+            st.download_button(
+                "下载知识库完整快照 ZIP",
+                data=export_kb_snapshot_bytes(),
+                file_name=f"industryscope_kb_snapshot_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+        with snap_col2:
+            if st.button("立即同步到远端 S3/R2", use_container_width=True, disabled=not s3_sync_enabled()):
+                try:
+                    st.success(upload_kb_snapshot_to_s3())
+                except Exception as exc:
+                    st.error(f"远端同步失败：{exc}")
+
+        restore_file = st.file_uploader(
+            "恢复知识库快照 ZIP（只接受 .zip，不接受 PDF/DOCX）",
+            type=["zip"],
+            key="kb_snapshot_restore",
+        )
+        restore_mode = st.radio("恢复模式", ["合并到当前知识库", "替换当前知识库"], horizontal=True)
+        restore_col1, restore_col2 = st.columns(2)
+        with restore_col1:
+            if st.button("导入快照 ZIP", use_container_width=True):
+                if not restore_file:
+                    st.error("请先选择知识库快照 ZIP。普通 PDF/DOCX 请上传到上方“上传并入库”。")
+                else:
+                    try:
+                        result = import_kb_snapshot_bytes(
+                            restore_file.getvalue(),
+                            merge=restore_mode == "合并到当前知识库",
+                        )
+                        sync_kb_after_write()
+                        st.success(f"已恢复 {result['documents']} 个文档、{result['chunks']} 个片段。")
+                    except Exception as exc:
+                        st.error(f"恢复失败：{exc}")
+        with restore_col2:
+            if st.button("从远端 S3/R2 恢复", use_container_width=True, disabled=not s3_sync_enabled()):
+                try:
+                    result = restore_kb_snapshot_from_s3(merge=restore_mode == "合并到当前知识库")
+                    st.success(f"已从 {result.get('remote')} 恢复 {result['documents']} 个文档、{result['chunks']} 个片段。")
+                except Exception as exc:
+                    st.error(f"远端恢复失败：{exc}")
 
     with st.expander("微信公众号自动补新", expanded=False):
         st.caption("通过搜狗微信搜索发现公开公众号文章，抓取可访问正文并生成 Markdown 文档入库。遇到验证码、过期链接或微信环境校验时会跳过并提示。")
