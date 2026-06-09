@@ -25,6 +25,13 @@ DEFAULT_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     "Referer": "https://weixin.sogou.com/",
 }
+HEADER_ALLOWLIST = {
+    "accept": "Accept",
+    "accept-language": "Accept-Language",
+    "cookie": "Cookie",
+    "referer": "Referer",
+    "user-agent": "User-Agent",
+}
 
 
 @dataclass
@@ -106,6 +113,46 @@ def restore_sogou_redirect_url(script_html: str) -> str:
 def make_sogou_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
+    return session
+
+
+def parse_browser_headers(raw: str) -> dict[str, str]:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    headers: dict[str, str] = {}
+    header_lines: list[str] = []
+    header_lines.extend(re.findall(r"-H\s+['\"]([^'\"]+?:\s*[^'\"]+)['\"]", text))
+    header_lines.extend(re.findall(r"--header\s+['\"]([^'\"]+?:\s*[^'\"]+)['\"]", text))
+    header_lines.extend(text.splitlines())
+
+    for raw_line in header_lines:
+        line = raw_line.strip().strip("'\"")
+        if not line:
+            continue
+        if line.lower().startswith("-h "):
+            line = line[3:].strip().strip("'\"")
+        if line.lower().startswith("--header "):
+            line = line[9:].strip().strip("'\"")
+        if ":" in line:
+            name, value = line.split(":", 1)
+            canonical = HEADER_ALLOWLIST.get(name.strip().lower())
+            if canonical and value.strip():
+                headers[canonical] = value.strip()
+
+    if not headers and "=" in text:
+        cookie = text
+        if cookie.lower().startswith("cookie:"):
+            cookie = cookie.split(":", 1)[1]
+        headers["Cookie"] = cookie.strip()
+    return headers
+
+
+def make_browser_state_session(browser_state: str = "") -> requests.Session:
+    session = make_sogou_session()
+    headers = parse_browser_headers(browser_state)
+    if headers:
+        session.headers.update(headers)
     return session
 
 
@@ -196,9 +243,19 @@ def resolve_sogou_search_url(search_url: str) -> str:
     return resolve_sogou_link(session, search_url)
 
 
-def fetch_wechat_article(url: str, title_hint: str = "", account_hint: str = "", date_hint: str = "") -> WechatArticle:
-    session = requests.Session()
-    session.headers.update(DEFAULT_HEADERS)
+def resolve_sogou_search_url_with_browser_state(search_url: str, browser_state: str = "") -> str:
+    session = make_browser_state_session(browser_state)
+    return resolve_sogou_link(session, search_url)
+
+
+def fetch_wechat_article(
+    url: str,
+    title_hint: str = "",
+    account_hint: str = "",
+    date_hint: str = "",
+    browser_state: str = "",
+) -> WechatArticle:
+    session = make_browser_state_session(browser_state)
     response = session.get(url, timeout=18)
     response.raise_for_status()
     if "环境异常" in response.text or "访问过于频繁" in response.text or "验证码" in response.text:
@@ -222,6 +279,22 @@ def fetch_wechat_article(url: str, title_hint: str = "", account_hint: str = "",
         content=content,
         images=images,
         html_title=normalize_space(soup.title.get_text(" ", strip=True) if soup.title else ""),
+    )
+
+
+def fetch_wechat_article_with_browser_state(
+    url: str,
+    browser_state: str = "",
+    title_hint: str = "",
+    account_hint: str = "",
+    date_hint: str = "",
+) -> WechatArticle:
+    return fetch_wechat_article(
+        url,
+        title_hint=title_hint,
+        account_hint=account_hint,
+        date_hint=date_hint,
+        browser_state=browser_state,
     )
 
 

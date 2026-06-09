@@ -47,11 +47,13 @@ from quark_ingest import (
 from wechat_ingest import (
     WECHAT_COLLECTOR_BOOKMARKLET,
     fetch_wechat_article,
+    fetch_wechat_article_with_browser_state,
     ingest_wechat_article,
     ingest_wechat_candidate_stub,
     ingest_wechat_clip_payload,
     ingest_wechat_fulltext,
     resolve_sogou_search_url,
+    resolve_sogou_search_url_with_browser_state,
     search_sogou_wechat,
 )
 
@@ -535,6 +537,57 @@ def ingest_wechat_candidates(
     return ok + stub_ok, errors
 
 
+def ingest_wechat_candidates_with_browser_state(
+    candidates: list[dict],
+    selected_indexes: list[int],
+    keyword: str,
+    industry_tags: str,
+    company_tags: str,
+    technology_tags: str,
+    browser_state: str,
+) -> tuple[int, list[str]]:
+    ok = 0
+    errors: list[str] = []
+    if not selected_indexes:
+        return ok, ["请至少选择一篇文章。"]
+    if not browser_state.strip():
+        return ok, ["请先粘贴浏览器 Cookie 或请求头。"]
+    progress = st.progress(0, text="正在用浏览器状态补抓公众号全文")
+    try:
+        for order, candidate_index in enumerate(selected_indexes, start=1):
+            item = candidates[candidate_index]
+            title = item.get("title", f"公众号文章 {candidate_index + 1}")
+            try:
+                progress.progress(order / len(selected_indexes), text=f"正在补抓：{title[:36]}")
+                article_url = item.get("url") or ""
+                if not article_url:
+                    article_url = resolve_sogou_search_url_with_browser_state(item.get("search_url", ""), browser_state)
+                if not article_url:
+                    raise RuntimeError("未能解析真实微信文章链接。")
+                article = fetch_wechat_article_with_browser_state(
+                    article_url,
+                    browser_state=browser_state,
+                    title_hint=title,
+                    account_hint=item.get("account", ""),
+                    date_hint=item.get("published_at", ""),
+                )
+                result = ingest_wechat_article(
+                    article,
+                    keyword=keyword or article.title,
+                    industry_tags=industry_tags or keyword or article.title,
+                    company_tags=company_tags,
+                    technology_tags=technology_tags,
+                    search_rank=int(item.get("rank", candidate_index + 1)),
+                )
+                ok += 1
+                st.toast(f"已补全文：{result['document'].get('title', title)}")
+            except Exception as exc:
+                errors.append(f"{title}: {exc}")
+    finally:
+        progress.empty()
+    return ok, errors
+
+
 def sync_kb_after_write() -> None:
     message = autosync_kb_snapshot()
     if message:
@@ -921,6 +974,31 @@ def render_knowledge_base() -> None:
                     sync_kb_after_write()
                 if errors:
                     st.error("\n".join(errors))
+            st.markdown("#### 用浏览器验证状态补抓全文（实验）")
+            st.caption("参考豆包方案中“真实浏览器会话/点击”的思路：你先在浏览器里打开搜狗或微信并通过验证，然后把该页面请求的 Cookie 或 Copy as cURL 请求头粘到这里。工具会临时复用这些请求头补抓当前勾选候选；失败时继续使用上方采集书签。")
+            browser_state = st.text_area(
+                "浏览器 Cookie 或请求头",
+                value="",
+                placeholder="可粘贴 Cookie: xxx=yyy; ...，也可粘贴 Chrome DevTools 里的 Copy as cURL 片段。不会写入知识库。",
+                height=110,
+                key="wechat_browser_state",
+            )
+            if st.button("用浏览器状态补抓当前勾选全文", use_container_width=True):
+                selected_indexes = [int(row["序号"]) - 1 for row in edited if row.get("选择")]
+                ok, errors = ingest_wechat_candidates_with_browser_state(
+                    candidates,
+                    selected_indexes,
+                    keyword=wechat_keyword.strip(),
+                    industry_tags=wechat_industry_tags.strip() or wechat_keyword.strip(),
+                    company_tags=wechat_company_tags.strip(),
+                    technology_tags=wechat_technology_tags.strip(),
+                    browser_state=browser_state,
+                )
+                if ok:
+                    st.success(f"成功补抓并入库 {ok} 篇公众号全文。")
+                    sync_kb_after_write()
+                if errors:
+                    st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
 
         if st.button("入库手动粘贴的微信文章链接", use_container_width=True):
             urls = [line.strip() for line in manual_wechat_urls.splitlines() if line.strip()]
