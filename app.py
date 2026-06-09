@@ -111,8 +111,8 @@ def render_wechat_quick_open_panel(candidates: list[dict]) -> None:
         f"""
         <div id="wechat-open-panel" style="font-family: system-ui, -apple-system, Segoe UI, sans-serif;">
           <div style="display:flex;gap:8px;align-items:center;margin:4px 0 8px;">
-            <strong style="font-size:14px;">快速打开验证窗口</strong>
-            <span style="font-size:12px;color:#667085;">通过验证后点击采集书签，浏览器允许时会自动关闭文章页。</span>
+            <strong style="font-size:14px;">快速打开文章</strong>
+            <span style="font-size:12px;color:#667085;">会以普通标签页打开，Chrome 书签栏可见；通过验证后点击书签栏里的 IndustryScope采集。</span>
           </div>
           <div id="wechat-open-list" style="display:grid;gap:6px;"></div>
         </div>
@@ -122,7 +122,7 @@ def render_wechat_quick_open_panel(candidates: list[dict]) -> None:
           items.forEach((item, index) => {{
             const row = document.createElement("div");
             row.style.display = "grid";
-            row.style.gridTemplateColumns = "92px minmax(0, 1fr)";
+            row.style.gridTemplateColumns = "92px 92px minmax(0, 1fr)";
             row.style.gap = "8px";
             row.style.alignItems = "center";
             const button = document.createElement("button");
@@ -132,7 +132,15 @@ def render_wechat_quick_open_panel(candidates: list[dict]) -> None:
             button.style.borderRadius = "6px";
             button.style.background = "#fff";
             button.style.cursor = "pointer";
-            button.onclick = () => window.open(item.url, "industryscope_wechat_" + index, "popup=yes,width=1180,height=900,left=80,top=40");
+            button.onclick = () => window.open(item.url, "_blank", "noopener,noreferrer");
+            const popupButton = document.createElement("button");
+            popupButton.textContent = "弹窗备用";
+            popupButton.style.height = "30px";
+            popupButton.style.border = "1px solid #cfd7cf";
+            popupButton.style.borderRadius = "6px";
+            popupButton.style.background = "#fff";
+            popupButton.style.cursor = "pointer";
+            popupButton.onclick = () => window.open(item.url, "industryscope_wechat_" + index, "popup=yes,width=1180,height=900,left=80,top=40");
             const meta = document.createElement("div");
             meta.style.minWidth = "0";
             meta.style.fontSize = "13px";
@@ -141,6 +149,7 @@ def render_wechat_quick_open_panel(candidates: list[dict]) -> None:
             meta.style.textOverflow = "ellipsis";
             meta.textContent = item.title + (item.account ? " · " + item.account : "") + (item.date ? " · " + item.date : "");
             row.appendChild(button);
+            row.appendChild(popupButton);
             row.appendChild(meta);
             root.appendChild(row);
           }});
@@ -879,7 +888,7 @@ def render_knowledge_base() -> None:
             height=68,
         )
         st.markdown("#### 半自动采集入库")
-        st.caption("推荐流程：先把下面脚本保存成浏览器书签；从候选列表打开文章，通过验证后点击该书签；它会复制正文和图片链接，必要时自动关闭文章页；回到这里粘贴并入库。")
+        st.caption("推荐流程：先把下面脚本保存成 Chrome 书签栏按钮；从候选列表用“打开文章”打开普通标签页，通过验证后点击书签栏里的采集按钮；它会复制正文和图片链接；回到这里粘贴并入库。")
         with st.popover("安装公众号采集书签"):
             st.markdown("1. 新建一个浏览器书签，名称可写 `IndustryScope采集`。")
             st.markdown("2. 把下面整段脚本复制到书签的网址/URL。")
