@@ -502,6 +502,7 @@ class ReportRequest:
     timeout_seconds: int = 900
     max_local_sources: int = 8
     prefer_wechat: bool = True
+    memo_enhance: bool = False
     use_knowledge_base: bool = True
     knowledge_mode: str = "自动判断"
     kb_top_k: int = 12
@@ -520,6 +521,7 @@ def build_prompt(req: ReportRequest) -> str:
     blocked = req.blocked_domains.strip() or "无。"
     allowed = req.allowed_domains.strip() or "无。"
     web_note = "请主动使用 web_search 检索公开资料。" if req.live_web else "当前为无实时搜索模式；若资料不足，必须明确说明证据不足，不要编造来源。"
+    memo_note = "调研纪要增强已开启：检索时必须优先尝试“行业关键词 纪要 / 调研纪要 / 专家电话会 / 交流纪要 / 产业链纪要 / 投资者交流”，尤其是微信公众号和转载源；纪要可用于发现关键变量、公司进展、产业链分歧和专家口径，但不得单独支撑强数据结论，必须与公告、论文、专利、公司材料、监管或权威报告交叉验证。" if req.memo_enhance else "调研纪要增强未开启。"
     wechat_note = "优先搜索并纳入 site:mp.weixin.qq.com 的微信公众号/产业文章作为中国市场线索，但必须在公众号内部继续区分：调研纪要/专家访谈/电话会/产业链纪要/海外投行或 SemiAnalysis、Bernstein 等机构研报翻译摘译 > 普通观点号 > 营销荐股号。公众号不得单独支撑市场份额、融资估值、客户订单、财务、全球第一等强结论；声称转述海外机构时必须继续追踪原始英文报告或 T0/T1/T2 来源。" if req.prefer_wechat else "不特别优先微信公众号文章。"
     return f"""你是一名严谨的产业研究负责人，正在为投资/战略决策生成可交付研报。
 
@@ -534,6 +536,7 @@ def build_prompt(req: ReportRequest) -> str:
 排除范围：{excluded}
 实时搜索要求：{web_note}
 微信公众号渠道偏好：{wechat_note}
+调研纪要增强：{memo_note}
 优先/限定域名：{allowed}
 提示词层面屏蔽域名：{blocked}
 
@@ -742,7 +745,12 @@ def search_public_web(req: ReportRequest, max_results: int = 12) -> list[dict[st
                 add(item.get("title", ""), item.get("url", ""), item.get("snippet", ""), retrieval_channel="bing_html", query=query)
         except Exception:
             continue
-    return rank_sources(results, prefer_wechat=req.prefer_wechat, max_results=max_results)
+    return rank_sources(
+        results,
+        prefer_wechat=req.prefer_wechat or req.memo_enhance,
+        memo_enhance=req.memo_enhance,
+        max_results=max_results,
+    )
 
 
 def industry_search_aliases(industry: str) -> list[str]:
@@ -790,6 +798,24 @@ def build_research_queries(req: ReportRequest, aliases: list[str]) -> list[str]:
     primary = aliases[1] if len(aliases) > 1 else req.industry
     year_month = datetime.now().strftime("%Y-%m")
     wechat_queries = []
+    memo_queries = []
+    if req.memo_enhance:
+        memo_queries = [
+            f"site:mp.weixin.qq.com {req.industry} 纪要",
+            f"site:mp.weixin.qq.com {req.industry} 调研纪要",
+            f"site:mp.weixin.qq.com {req.industry} 专家电话会",
+            f"site:mp.weixin.qq.com {req.industry} 交流纪要",
+            f"site:mp.weixin.qq.com {req.industry} 产业链纪要",
+            f"site:mp.weixin.qq.com {req.industry} 投资者交流",
+            f"site:mp.weixin.qq.com {req.industry} 机构纪要 专家交流",
+            f"{req.industry} 纪要 微信公众号",
+            f"{req.industry} 调研纪要 专家交流 电话会",
+            f"{req.industry} 专家访谈 产业链调研 微信",
+            f"{req.industry} 纪要 研报 PDF",
+            f"{req.industry} 机构调研 投资者关系 活动记录表",
+            f"{req.industry} expert call transcript",
+            f"{core} expert interview transcript industry channel check",
+        ]
     if req.prefer_wechat:
         wechat_queries = [
             f"site:mp.weixin.qq.com {req.industry} 深度 产业链 市场规模",
@@ -811,7 +837,7 @@ def build_research_queries(req: ReportRequest, aliases: list[str]) -> list[str]:
             f"{req.industry} 微信公众号 深度研究 行业报告",
         ]
     deep_signal_queries = build_deep_signal_queries(req, aliases)
-    queries = wechat_queries + deep_signal_queries + [
+    queries = memo_queries + wechat_queries + deep_signal_queries + [
         f"{req.industry} 最新 进展 动作 {year_month} 2026",
         f"{req.industry} 最近 30 天 90 天 180 天 公司 动作 2026",
         f"{req.industry} 技术路线 市场规模 产业链 竞争格局 2026",
@@ -1124,7 +1150,12 @@ def source_profile(industry: str, title: str, url: str, snippet: str = "", relev
     }
 
 
-def rank_sources(sources: list[dict[str, str]], prefer_wechat: bool = False, max_results: int | None = None) -> list[dict[str, str]]:
+def rank_sources(
+    sources: list[dict[str, str]],
+    prefer_wechat: bool = False,
+    memo_enhance: bool = False,
+    max_results: int | None = None,
+) -> list[dict[str, str]]:
     def score(item: dict[str, str]) -> int:
         density = int(item.get("evidence_density", "0") or 0)
         tier_bonus = {"T0": 80, "T1": 55, "T2": 30, "T3": 10}.get(item.get("source_tier", "T3"), 0)
@@ -1146,7 +1177,8 @@ def rank_sources(sources: list[dict[str, str]], prefer_wechat: bool = False, max
         if len(selected) >= max_results:
             break
         selected.append(item)
-    wechat_slots = min(len(wechat), max(1, max_results // 5))
+    wechat_ratio = 3 if memo_enhance else 5
+    wechat_slots = min(len(wechat), max(1, max_results // wechat_ratio))
     for item in wechat[:wechat_slots]:
         if len(selected) >= max_results:
             break

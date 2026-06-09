@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -66,7 +67,8 @@ def local_bridge_unavailable_hint() -> str:
     return (
         "当前部署环境无法访问你电脑上的 Chrome。Streamlit Cloud 里的 127.0.0.1 是云服务器自己，"
         "不是你的本机浏览器；本机浏览器抽取和 OpenCLI Browser Bridge 只适合本地运行 IndustryScope，"
-        "或另行配置可被云端访问的安全桥接服务。云端请使用“打开文章 -> 通过验证 -> Chrome 书签采集 -> 粘贴 JSON 入库”。"
+        "或另行配置可被云端访问的安全桥接服务。云端请优先使用“打开文章 -> 通过验证 -> 复制正文 -> 智能粘贴入库”；"
+        "需要图片链接时再使用 Chrome 书签采集 JSON。"
     )
 from quark_ingest import (
     SUPPORTED_SUFFIXES as QUARK_SUPPORTED_SUFFIXES,
@@ -140,7 +142,7 @@ def render_wechat_quick_open_panel(candidates: list[dict]) -> None:
         <div id="wechat-open-panel" style="font-family: system-ui, -apple-system, Segoe UI, sans-serif;">
           <div style="display:flex;gap:8px;align-items:center;margin:4px 0 8px;">
             <strong style="font-size:14px;">快速打开文章</strong>
-            <span style="font-size:12px;color:#667085;">会以普通标签页打开，Chrome 书签栏可见；通过验证后点击书签栏里的 IndustryScope采集。</span>
+            <span style="font-size:12px;color:#667085;">会以普通标签页打开；通过验证后复制正文，或点击书签栏里的 IndustryScope采集。</span>
           </div>
           <div id="wechat-open-list" style="display:grid;gap:6px;"></div>
         </div>
@@ -260,6 +262,61 @@ def wechat_items_match(
     target_account = normalize_wechat_identity(account or other.get("account", "") or other.get("source_org", ""))
     item_account = normalize_wechat_identity(item.get("account", "") or item.get("source_org", ""))
     return not target_account or not item_account or target_account in item_account or item_account in target_account
+
+
+def infer_wechat_paste_metadata(raw_text: str, fallback_title: str = "", fallback_url: str = "", fallback_account: str = "") -> dict[str, str]:
+    text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+    url = fallback_url.strip()
+    if not url:
+        match = re.search(r"https?://mp\.weixin\.qq\.com/[^\s)）>\"']+", text)
+        if match:
+            url = match.group(0).rstrip("，。；;、")
+
+    published_at = ""
+    for pattern in [
+        r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?",
+        r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
+    ]:
+        match = re.search(pattern, text)
+        if match:
+            year, month, day = match.groups()
+            published_at = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+            break
+
+    title = fallback_title.strip()
+    if not title and lines:
+        ignored = {"原创", "微信扫一扫", "继续滑动看下一个", "轻触阅读原文", "展开全文"}
+        for line in lines[:12]:
+            if line in ignored or line.startswith("http"):
+                continue
+            if len(line) <= 90:
+                title = line
+                break
+
+    account = fallback_account.strip()
+    if not account and lines:
+        for idx, line in enumerate(lines[:20]):
+            if line == title and idx + 1 < len(lines):
+                candidate = lines[idx + 1]
+                if 2 <= len(candidate) <= 40 and not re.search(r"\d{4}[-/年]\d{1,2}", candidate):
+                    account = candidate
+                break
+    if not account:
+        for pattern in [r"公众号[:：]\s*([^\n]{2,40})", r"作者[:：]\s*([^\n]{2,40})"]:
+            match = re.search(pattern, text)
+            if match:
+                account = match.group(1).strip()
+                break
+
+    return {
+        "title": title,
+        "url": url,
+        "account": account,
+        "published_at": published_at,
+        "content": text,
+    }
 
 
 def upsert_wechat_failed_candidate(item: dict, error: str, keyword: str = "") -> dict:
@@ -433,6 +490,11 @@ def sidebar_request() -> tuple[ReportRequest, str, bool]:
             value=True,
             help="提高微信公众号/产业文章在检索和排序中的优先级，但仍会标注为需复核来源，不允许单独支撑强结论。",
         )
+        memo_enhance = st.toggle(
+            "调研纪要增强",
+            value=False,
+            help="开启后会优先检索“行业关键词 纪要/调研纪要/专家电话会/交流纪要/产业链纪要”，尤其关注微信公众号和转载源，但仍保留论文、公告、专利、公司材料等交叉验证来源。",
+        )
         source_default = 18 if (depth or "标准版") == "深度版" else 14
         max_local_sources = st.slider(
             "高价值来源数",
@@ -518,6 +580,7 @@ def sidebar_request() -> tuple[ReportRequest, str, bool]:
         timeout_seconds=timeout_seconds,
         max_local_sources=max_local_sources,
         prefer_wechat=prefer_wechat,
+        memo_enhance=memo_enhance,
         use_knowledge_base=knowledge_mode != "不使用知识库" and kb_top_k > 0,
         knowledge_mode=knowledge_mode,
         kb_top_k=kb_top_k,
@@ -849,11 +912,11 @@ def render_wechat_failed_queue(
         return
 
     st.markdown("#### 待手动补全文队列")
-    st.caption("这些是系统已经自动尝试抓正文但失败的文章。搜狗跳转验证码出现后，云端无法稳定解析真实微信链接；主流程是打开文章、通过验证、点击 Chrome 书签栏里的 IndustryScope采集，然后把采集 JSON 粘回上方入库。")
+    st.caption("这些是系统已经自动尝试抓正文但失败的文章。搜狗跳转验证码出现后，云端无法稳定解析真实微信链接；主流程是打开文章、通过验证、复制正文，然后粘回上方“免书签智能粘贴入库”。")
     st.info(f"当前有 {len(failed_candidates)} 篇待补全文。候选线索已入库，但不会作为报告强证据；补入全文后才会进入报告证据池。")
     if is_streamlit_cloud():
         st.warning(local_bridge_unavailable_hint())
-    st.success("推荐处理顺序：先点下方“快速打开文章”，通过搜狗/微信验证后在正文页点击 Chrome 书签栏的 IndustryScope采集；回到上方“粘贴采集 JSON”入库。不要用 OpenCLI 直接处理搜狗跳转链接，它只接受真实 mp.weixin.qq.com 链接。")
+    st.success("推荐处理顺序：先点下方“快速打开文章”，通过搜狗/微信验证后复制文章可见正文；回到上方“免书签智能粘贴入库”粘贴。需要图片链接时再使用采集书签；OpenCLI 只接受真实 mp.weixin.qq.com 链接。")
 
     render_wechat_quick_open_panel(failed_candidates)
     rows = []
@@ -1275,8 +1338,61 @@ def render_knowledge_base() -> None:
             placeholder="每行一个 mp.weixin.qq.com 链接。用于搜狗跳转触发验证码时的稳定备用入口。",
             height=68,
         )
-        st.markdown("#### 半自动采集入库")
-        st.caption("推荐流程：先把下面脚本保存成 Chrome 书签栏按钮；从候选列表用“打开文章”打开普通标签页，通过验证后点击书签栏里的采集按钮；它会复制正文和图片链接；回到这里粘贴并入库。")
+        st.markdown("#### 免书签智能粘贴入库")
+        st.caption("云端推荐流程：从候选列表打开文章，通过验证后直接复制正文；回到这里粘贴，系统会自动识别标题、公众号、日期和真实微信链接。浏览器安全策略不允许 Streamlit 弹窗自动读取微信正文，所以这一步是当前最稳的低门槛方案。")
+        smart_paste_text = st.text_area(
+            "粘贴公众号页面文字",
+            value="",
+            placeholder="可以直接 Ctrl+A / 复制文章可见文字后粘贴。第一行通常会被识别为标题；如果粘贴内容里包含 mp.weixin.qq.com 链接，也会自动保存为原文链接。",
+            height=220,
+            key="wechat_smart_paste_text",
+        )
+        smart_col1, smart_col2 = st.columns(2)
+        with smart_col1:
+            smart_title_hint = st.text_input("标题修正（可选）", value="", key="wechat_smart_title_hint")
+            smart_url_hint = st.text_input("原文链接修正（可选）", value="", placeholder="https://mp.weixin.qq.com/s/...", key="wechat_smart_url_hint")
+        with smart_col2:
+            smart_account_hint = st.text_input("公众号修正（可选）", value="", key="wechat_smart_account_hint")
+            smart_keyword_hint = st.text_input("归档关键词修正（可选）", value="", placeholder="默认使用搜索关键词或识别标题", key="wechat_smart_keyword_hint")
+        if st.button("智能识别并入库公众号全文", type="primary", use_container_width=True):
+            try:
+                inferred = infer_wechat_paste_metadata(
+                    smart_paste_text,
+                    fallback_title=smart_title_hint,
+                    fallback_url=smart_url_hint,
+                    fallback_account=smart_account_hint,
+                )
+                if not inferred["title"]:
+                    inferred["title"] = smart_keyword_hint.strip() or wechat_keyword.strip() or "智能粘贴公众号全文"
+                result = ingest_wechat_fulltext(
+                    title=inferred["title"],
+                    content=inferred["content"],
+                    url=inferred["url"],
+                    account=inferred["account"],
+                    published_at=inferred["published_at"],
+                    keyword=smart_keyword_hint.strip() or wechat_keyword.strip() or inferred["title"],
+                    industry_tags=wechat_industry_tags.strip() or wechat_keyword.strip() or inferred["title"],
+                    company_tags=wechat_company_tags.strip(),
+                    technology_tags=wechat_technology_tags.strip(),
+                )
+                removed = remove_wechat_failed_candidate(
+                    url=inferred["url"],
+                    title=inferred["title"],
+                    account=inferred["account"],
+                    other=inferred,
+                )
+                st.success(
+                    f"已入库公众号全文：{result['document'].get('title', inferred['title'])}"
+                    f"；识别到公众号：{inferred['account'] or '未识别'}，日期：{inferred['published_at'] or '未识别'}。"
+                )
+                if removed:
+                    st.toast(f"已从待补全文队列移除 {removed} 条匹配文章。")
+                sync_kb_after_write()
+            except Exception as exc:
+                st.error(f"智能粘贴入库失败：{exc}")
+
+        st.markdown("#### 采集书签入库（高级：含图片链接）")
+        st.caption("需要保留图片/图表链接时使用：把下面脚本保存成 Chrome 书签栏按钮；打开公众号正文并通过验证后点击书签，它会复制正文和图片链接；回到这里粘贴 JSON 入库。手机端和弹窗页通常不适合这个流程。")
         with st.popover("安装公众号采集书签"):
             st.markdown("1. 新建一个浏览器书签，名称可写 `IndustryScope采集`。")
             st.markdown("2. 把下面整段脚本复制到书签的网址/URL。")
@@ -1369,11 +1485,11 @@ def render_knowledge_base() -> None:
         st.markdown("#### OpenCLI 微信下载入库（可选增强）")
         st.caption("OpenCLI 的 Browser Bridge + weixin adapter 可把真实 mp.weixin.qq.com 文章导出为 Markdown，并可下载图片。适合已经拿到真实微信链接后的标准化归档；未安装 OpenCLI 时会给出提示。")
         if is_streamlit_cloud():
-            st.warning("OpenCLI/Browser Bridge 在 Streamlit Cloud 上默认不可用；它需要和你的 Chrome/Bridge 在同一台机器上运行。云端请优先使用上方书签采集 JSON 入库。")
+            st.warning("OpenCLI/Browser Bridge 在 Streamlit Cloud 上默认不可用；它需要和你的 Chrome/Bridge 在同一台机器上运行。云端请优先使用上方“免书签智能粘贴入库”；需要图片链接时再用采集书签 JSON。")
         with st.popover("OpenCLI 使用边界"):
             st.markdown("1. OpenCLI 不是验证码破解工具；它复用你本机浏览器/Bridge 的可访问状态。")
             st.markdown("2. 这里需要真实 `mp.weixin.qq.com` 链接，搜狗跳转链接请先打开文章后复制真实链接。")
-            st.markdown("3. 如果云端部署无法访问本机 Browser Bridge，建议继续使用书签采集或本机运行 IndustryScope。")
+            st.markdown("3. 如果云端部署无法访问本机 Browser Bridge，建议继续使用智能粘贴/书签采集，或本机运行 IndustryScope。")
             st.code("opencli weixin download --url <mp.weixin.qq.com文章链接> --output <目录>", language="powershell")
         opencli_command = st.text_input(
             "OpenCLI 命令或路径",
@@ -1564,7 +1680,7 @@ def render_knowledge_base() -> None:
                         st.error(f"搜索失败：{exc}")
 
         st.markdown("#### 用浏览器验证状态补抓全文（实验）")
-        st.caption("可选：你先在浏览器里打开搜狗或微信并通过验证，然后把该页面请求的 Cookie 或 Copy as cURL 请求头粘到这里。工具会临时复用这些请求头补抓候选或失败队列；仍失败时继续使用上方采集书签。")
+        st.caption("可选：你先在浏览器里打开搜狗或微信并通过验证，然后把该页面请求的 Cookie 或 Copy as cURL 请求头粘到这里。工具会临时复用这些请求头补抓候选或失败队列；仍失败时继续使用上方智能粘贴入库。")
         browser_state = st.text_area(
             "浏览器 Cookie 或请求头",
             value="",
