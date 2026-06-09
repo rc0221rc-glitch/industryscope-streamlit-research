@@ -87,7 +87,7 @@ streamlit run app.py
 
 ## 微信公众号正文增强
 
-公众号正文获取采用分层策略：先用公开 HTTP 抽取，失败后进入“待手动补全文队列”；用户也可以用 Chrome 书签采集、手动粘贴全文，或启用“本机浏览器抽取入库”。
+公众号正文获取采用分层策略：先用公开 HTTP 抽取，失败后进入“待手动补全文队列”；用户也可以用 Chrome 书签采集、手动粘贴全文，启用“本机浏览器抽取入库”，或使用 OpenCLI 的 `weixin download` 进行标准化 Markdown 归档。
 
 本机浏览器抽取借鉴 web-access / OpenCLI Browser Bridge 的思路：IndustryScope 通过 Chrome DevTools Protocol 读取你已经打开并通过验证的真实浏览器 DOM，不破解验证码，不绕过登录或付费限制。
 
@@ -100,6 +100,8 @@ start chrome --remote-debugging-port=9222 --user-data-dir="%TEMP%\industryscope-
 然后在这个 Chrome 窗口里打开公众号文章，通过验证并停留在正文页；回到知识库页，保持 `Chrome DevTools / web-access 地址` 为 `http://127.0.0.1:9222`，点击“从当前 Chrome 公众号页抽取并入库”。
 
 注意：Streamlit Cloud 服务器不能直接读取用户电脑上的 Chrome。这个能力适用于本地运行 IndustryScope，或未来配置本机 web-access/OpenCLI 代理桥接的场景；云端部署仍保留自动抽取、失败队列和书签采集流程。
+
+OpenCLI 增强：如果已安装 OpenCLI，并配置好 Browser Bridge，可在知识库页粘贴真实 `mp.weixin.qq.com` 链接，调用 `opencli weixin download --url ... --output ...` 下载 Markdown 后入库。它适合“已经拿到真实微信链接”的归档场景；搜狗跳转链接仍建议先用本机浏览器抽取或手动打开后复制真实链接。
 
 ## 设计文档
 

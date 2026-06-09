@@ -24,7 +24,12 @@ from report_engine import (
 )
 from openai import APITimeoutError
 
-from browser_ingest import DEFAULT_CDP_ENDPOINT, ingest_current_browser_wechat_article
+from browser_ingest import (
+    DEFAULT_CDP_ENDPOINT,
+    DEFAULT_OPENCLI_COMMAND,
+    ingest_current_browser_wechat_article,
+    ingest_opencli_weixin_download,
+)
 from knowledge_base import (
     SOURCE_TYPE_TIERS,
     add_document,
@@ -815,6 +820,7 @@ def render_wechat_failed_queue(
     technology_tags: str,
     browser_state: str = "",
     cdp_endpoint: str = "",
+    opencli_command: str = "",
 ) -> None:
     failed_candidates = get_wechat_failed_candidates()
     if not failed_candidates:
@@ -925,6 +931,48 @@ def render_wechat_failed_queue(
                 upsert_wechat_failed_candidate(item, str(exc), keyword=keyword or item.get("keyword", ""))
         if ok:
             st.success(f"已从当前浏览器页补全文并入库 {ok} 篇。")
+            sync_kb_after_write()
+        if errors:
+            st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
+
+    st.markdown("##### 用 OpenCLI 补真实微信链接")
+    st.caption("适合失败队列中已经有真实 mp.weixin.qq.com 链接的文章。搜狗跳转链接无法直接下载，需先打开文章取得真实链接。")
+    if st.button("用 OpenCLI 下载当前勾选真实微信链接", use_container_width=True):
+        if not selected_indexes:
+            st.error("请先在失败队列里勾选至少一篇文章。")
+            return
+        ok = 0
+        errors: list[str] = []
+        for index in selected_indexes:
+            if index < 0 or index >= len(failed_candidates):
+                continue
+            item = failed_candidates[index]
+            url = item.get("url", "") or item.get("source_url", "")
+            if "mp.weixin.qq.com" not in url:
+                errors.append(f"{item.get('title', '未命名文章')}: 不是真实微信链接，请先打开文章复制 mp.weixin.qq.com 链接或使用当前浏览器页抽取。")
+                continue
+            try:
+                result = ingest_opencli_weixin_download(
+                    url,
+                    opencli_command=opencli_command or DEFAULT_OPENCLI_COMMAND,
+                    keyword=keyword or item.get("keyword", "") or item.get("title", ""),
+                    industry_tags=industry_tags or keyword or item.get("title", ""),
+                    company_tags=company_tags,
+                    technology_tags=technology_tags,
+                )
+                ok += 1
+                remove_wechat_failed_candidate(
+                    url=result.get("source_url", url),
+                    title=result.get("title", item.get("title", "")),
+                    account=item.get("account", ""),
+                    other=item,
+                )
+                st.toast(f"OpenCLI 已入库：{result['document'].get('title', item.get('title', '未命名文章'))}")
+            except Exception as exc:
+                errors.append(f"{item.get('title', '未命名文章')}: {exc}")
+                upsert_wechat_failed_candidate(item, str(exc), keyword=keyword or item.get("keyword", ""))
+        if ok:
+            st.success(f"OpenCLI 成功下载并入库 {ok} 篇。")
             sync_kb_after_write()
         if errors:
             st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
@@ -1272,6 +1320,67 @@ def render_knowledge_base() -> None:
             except Exception as exc:
                 st.error(f"浏览器抽取入库失败：{exc}")
 
+        st.markdown("#### OpenCLI 微信下载入库（可选增强）")
+        st.caption("OpenCLI 的 Browser Bridge + weixin adapter 可把真实 mp.weixin.qq.com 文章导出为 Markdown，并可下载图片。适合已经拿到真实微信链接后的标准化归档；未安装 OpenCLI 时会给出提示。")
+        with st.popover("OpenCLI 使用边界"):
+            st.markdown("1. OpenCLI 不是验证码破解工具；它复用你本机浏览器/Bridge 的可访问状态。")
+            st.markdown("2. 这里需要真实 `mp.weixin.qq.com` 链接，搜狗跳转链接请先打开文章后复制真实链接。")
+            st.markdown("3. 如果云端部署无法访问本机 Browser Bridge，建议继续使用书签采集或本机运行 IndustryScope。")
+            st.code("opencli weixin download --url <mp.weixin.qq.com文章链接> --output <目录>", language="powershell")
+        opencli_command = st.text_input(
+            "OpenCLI 命令或路径",
+            value=DEFAULT_OPENCLI_COMMAND,
+            placeholder="opencli 或 C:\\path\\to\\opencli.exe",
+            key="wechat_opencli_command",
+        )
+        opencli_urls = st.text_area(
+            "OpenCLI 下载真实微信链接",
+            value="",
+            placeholder="每行一个真实 mp.weixin.qq.com 文章链接。",
+            height=80,
+            key="wechat_opencli_urls",
+        )
+        opencli_download_images = st.toggle("OpenCLI 下载图片", value=True, key="wechat_opencli_download_images")
+        if st.button("用 OpenCLI 下载并入库微信文章", use_container_width=True):
+            urls = [line.strip() for line in opencli_urls.splitlines() if line.strip()]
+            if not urls:
+                st.error("请先粘贴至少一个真实 mp.weixin.qq.com 链接。")
+            else:
+                ok = 0
+                errors: list[str] = []
+                progress = st.progress(0, text="正在用 OpenCLI 下载微信文章")
+                try:
+                    for idx, url in enumerate(urls, start=1):
+                        try:
+                            progress.progress(idx / len(urls), text=f"OpenCLI 正在处理第 {idx} 篇")
+                            result = ingest_opencli_weixin_download(
+                                url,
+                                opencli_command=opencli_command.strip() or DEFAULT_OPENCLI_COMMAND,
+                                keyword=wechat_keyword.strip(),
+                                industry_tags=wechat_industry_tags.strip() or wechat_keyword.strip(),
+                                company_tags=wechat_company_tags.strip(),
+                                technology_tags=wechat_technology_tags.strip(),
+                                download_images=bool(opencli_download_images),
+                            )
+                            ok += 1
+                            removed = remove_wechat_failed_candidate(
+                                url=result.get("source_url", url),
+                                title=result.get("title", ""),
+                                other={"url": url, "title": result.get("title", "")},
+                            )
+                            st.toast(f"OpenCLI 已入库：{result['document'].get('title', result.get('title', '未命名文章'))}")
+                            if removed:
+                                st.toast(f"已从待补全文队列移除 {removed} 条匹配文章。")
+                        except Exception as exc:
+                            errors.append(f"{url}: {exc}")
+                finally:
+                    progress.empty()
+                if ok:
+                    st.success(f"OpenCLI 成功下载并入库 {ok} 篇微信文章。")
+                    sync_kb_after_write()
+                if errors:
+                    st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
+
         st.markdown("#### 手动粘贴公众号全文入库")
         st.caption("备用流程：如果不想使用采集书签，也可以手动复制正文。这里粘贴的全文会作为真正的知识库证据；只保存候选链接的条目不会支撑报告强结论。")
         manual_full_title = st.text_input("文章标题", value="", key="manual_wechat_full_title")
@@ -1480,6 +1589,7 @@ def render_knowledge_base() -> None:
             technology_tags=wechat_technology_tags.strip(),
             browser_state=browser_state,
             cdp_endpoint=cdp_endpoint.strip() or DEFAULT_CDP_ENDPOINT,
+            opencli_command=opencli_command.strip() or DEFAULT_OPENCLI_COMMAND,
         )
 
         if st.button("入库手动粘贴的微信文章链接", use_container_width=True):

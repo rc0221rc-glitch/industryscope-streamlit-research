@@ -2,18 +2,24 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
 import requests
 from bs4 import BeautifulSoup
 
+from knowledge_base import add_document, filename_safe
 from wechat_ingest import WechatArticle, clean_text, ingest_wechat_article, normalize_space
 
 
 DEFAULT_CDP_ENDPOINT = "http://127.0.0.1:9222"
+DEFAULT_OPENCLI_COMMAND = "opencli"
 
 
 CDP_EXTRACT_SCRIPT = r"""
@@ -263,3 +269,118 @@ def data_url_to_wechat_article(data_url: str, title_hint: str = "") -> WechatArt
     raw = match.group(1)
     html_text = unquote(raw)
     return html_to_wechat_article(html_text, title_hint=title_hint)
+
+
+def find_opencli_command(command_hint: str = "") -> str:
+    command = (command_hint or DEFAULT_OPENCLI_COMMAND).strip()
+    if not command:
+        command = DEFAULT_OPENCLI_COMMAND
+    resolved = shutil.which(command)
+    if resolved:
+        return resolved
+    if Path(command).exists():
+        return command
+    raise RuntimeError("未找到 opencli 命令。请先安装 OpenCLI，并确认命令可在当前运行环境的 PATH 中访问。")
+
+
+def parse_markdown_frontmatter(markdown_text: str) -> dict[str, str]:
+    if not markdown_text.startswith("---"):
+        return {}
+    match = re.match(r"---\s*\n(.*?)\n---\s*\n", markdown_text, flags=re.DOTALL)
+    if not match:
+        return {}
+    meta: dict[str, str] = {}
+    for line in match.group(1).splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        meta[key.strip().lower()] = value.strip().strip("'\"")
+    return meta
+
+
+def find_opencli_markdown(output_dir: Path) -> Path:
+    markdown_files = sorted(output_dir.rglob("*.md"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not markdown_files:
+        raise RuntimeError("OpenCLI 执行完成但没有生成 Markdown 文件。")
+    return markdown_files[0]
+
+
+def ingest_opencli_weixin_download(
+    url: str,
+    *,
+    opencli_command: str = DEFAULT_OPENCLI_COMMAND,
+    keyword: str = "",
+    industry_tags: str = "",
+    company_tags: str = "",
+    technology_tags: str = "",
+    download_images: bool = True,
+    timeout_seconds: int = 90,
+) -> dict[str, Any]:
+    clean_url = normalize_space(url)
+    if "mp.weixin.qq.com" not in clean_url:
+        raise RuntimeError("OpenCLI download 需要真实 mp.weixin.qq.com 文章链接；搜狗跳转链接请先用当前浏览器页抽取或手动打开后复制真实链接。")
+
+    command = find_opencli_command(opencli_command)
+    with tempfile.TemporaryDirectory(prefix="industryscope_opencli_") as tmp:
+        output_dir = Path(tmp)
+        args = [command, "weixin", "download", "--url", clean_url, "--output", str(output_dir)]
+        if download_images:
+            args.append("--download-images")
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            message = "\n".join(part for part in [result.stdout.strip(), result.stderr.strip()] if part)
+            raise RuntimeError(f"OpenCLI weixin download 失败：{message or f'exit code {result.returncode}'}")
+
+        markdown_path = find_opencli_markdown(output_dir)
+        markdown_text = markdown_path.read_text(encoding="utf-8", errors="ignore")
+        if len(clean_text(markdown_text)) < 120:
+            raise RuntimeError("OpenCLI 生成的 Markdown 正文太短，可能仍是验证页或文章不可访问。")
+
+        meta = parse_markdown_frontmatter(markdown_text)
+        title = meta.get("title") or markdown_path.stem
+        source_org = meta.get("author") or meta.get("account") or meta.get("source") or "OpenCLI Weixin"
+        publish_date = meta.get("publish_time") or meta.get("published_at") or meta.get("date") or ""
+        source_url = meta.get("source_url") or meta.get("url") or clean_url
+
+        stored_md = output_dir / f"{filename_safe(title)[:90]}_opencli.md"
+        header = "\n".join(
+            [
+                f"# {title}",
+                "",
+                "## 元数据",
+                f"- 原文链接：{source_url}",
+                f"- 公众号/作者：{source_org}",
+                f"- 发布日期：{publish_date or '未识别'}",
+                f"- 入库方式：OpenCLI weixin download",
+                "- 来源说明：通过 OpenCLI Browser Bridge/weixin adapter 导出 Markdown；公众号内容质量参差不齐，强结论需与一手公开来源交叉验证。",
+                "",
+                "## OpenCLI 导出正文",
+                "",
+            ]
+        )
+        stored_md.write_text(header + markdown_text, encoding="utf-8")
+        doc = add_document(
+            stored_md,
+            title=title,
+            source_type="公众号/媒体转载",
+            source_org=source_org,
+            publish_date=publish_date,
+            industry_tags=industry_tags or keyword or title,
+            company_tags=company_tags,
+            technology_tags=technology_tags,
+            source_url=source_url,
+        )
+        return {
+            "document": asdict(doc),
+            "markdown_path": str(markdown_path),
+            "source_url": source_url,
+            "title": title,
+            "stdout": result.stdout,
+        }
