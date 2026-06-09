@@ -474,7 +474,7 @@ def render_knowledge_base() -> None:
     st.caption(f"本地缓存目录：{stats['root']}。Streamlit Cloud 本地磁盘可能在重启/重新部署后丢失；建议使用下方快照备份，或配置 S3/R2 远端持久化。")
 
     with st.expander("上传并入库", expanded=True):
-        st.caption("建议分批上传：每批不超过 20 个文件、单文件不超过 100-200MB。Streamlit 会先把上传文件放入内存，超大批量可能导致应用重启。")
+        st.caption("可一次选择多个文件，工具会逐个入库并记录失败项。注意 Streamlit 会先接收上传内容，超大批量仍受部署平台内存和单文件大小限制。")
         uploaded = st.file_uploader(
             "上传文档",
             type=["pdf", "docx", "md", "txt", "html", "htm", "xlsx", "xls", "csv"],
@@ -493,15 +493,15 @@ def render_knowledge_base() -> None:
         if st.button("入库上传文档", type="primary", use_container_width=True):
             if not uploaded:
                 st.error("请先选择文件。")
-            elif len(uploaded) > 25:
-                st.error("本批文件过多。请分批上传，每批不超过 25 个文件，避免 Streamlit 内存峰值过高导致应用重启。")
             else:
                 ok = 0
                 errors: list[str] = []
                 total_size = sum(getattr(file, "size", 0) or 0 for file in uploaded)
                 if total_size > 350 * 1024 * 1024:
-                    st.warning("本批上传文件总量较大，入库时可能较慢；如部署在 Streamlit Cloud，建议拆成更小批次。")
-                for file in uploaded:
+                    st.warning("本批上传文件总量较大，入库时可能较慢；Streamlit 会先接收上传内容，若平台内存不足仍可能重启。工具不会限制单次数量，会尽量逐个处理。")
+                upload_progress = st.progress(0, text="正在入库上传文档")
+                for index, file in enumerate(uploaded, start=1):
+                    upload_progress.progress(index / len(uploaded), text=f"正在处理 {index}/{len(uploaded)}：{file.name[:42]}")
                     suffix = Path(file.name).suffix
                     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                         tmp.write(file.getbuffer())
@@ -524,6 +524,7 @@ def render_knowledge_base() -> None:
                         errors.append(f"{file.name}: {exc}")
                     finally:
                         tmp_path.unlink(missing_ok=True)
+                upload_progress.empty()
                 if ok:
                     st.success(f"成功入库 {ok} 个文档。")
                     sync_kb_after_write()
