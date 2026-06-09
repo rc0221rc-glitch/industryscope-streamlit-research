@@ -24,6 +24,7 @@ from report_engine import (
 )
 from openai import APITimeoutError
 
+from browser_ingest import DEFAULT_CDP_ENDPOINT, ingest_current_browser_wechat_article
 from knowledge_base import (
     SOURCE_TYPE_TIERS,
     add_document,
@@ -813,6 +814,7 @@ def render_wechat_failed_queue(
     company_tags: str,
     technology_tags: str,
     browser_state: str = "",
+    cdp_endpoint: str = "",
 ) -> None:
     failed_candidates = get_wechat_failed_candidates()
     if not failed_candidates:
@@ -885,6 +887,47 @@ def render_wechat_failed_queue(
         if st.button("清空待补全文队列", use_container_width=True):
             clear_wechat_failed_candidates()
             st.success("已清空待手动补全文队列。")
+
+    st.markdown("##### 从当前浏览器页补全文")
+    st.caption("适合处理已经在 Chrome 中打开并通过验证的公众号文章。先在上表勾选对应文章，再让 Chrome 当前页停在正文页，点击下面按钮即可从真实浏览器 DOM 抽取并入库。")
+    if st.button("用当前浏览器公众号页补当前勾选", use_container_width=True):
+        if not selected_indexes:
+            st.error("请先在失败队列里勾选一篇文章。")
+            return
+        ok = 0
+        errors: list[str] = []
+        for index in selected_indexes:
+            if index < 0 or index >= len(failed_candidates):
+                continue
+            item = failed_candidates[index]
+            try:
+                result = ingest_current_browser_wechat_article(
+                    cdp_endpoint or DEFAULT_CDP_ENDPOINT,
+                    keyword=keyword or item.get("keyword", "") or item.get("title", ""),
+                    industry_tags=industry_tags or keyword or item.get("title", ""),
+                    company_tags=company_tags,
+                    technology_tags=technology_tags,
+                    url_hint=item.get("url", "") or item.get("search_url", ""),
+                    title_hint=item.get("title", ""),
+                    search_rank=int(item.get("rank", index + 1) or index + 1),
+                )
+                article = result.get("article", {})
+                ok += 1
+                remove_wechat_failed_candidate(
+                    url=article.get("url", "") if isinstance(article, dict) else "",
+                    title=article.get("title", item.get("title", "")) if isinstance(article, dict) else item.get("title", ""),
+                    account=article.get("account", item.get("account", "")) if isinstance(article, dict) else item.get("account", ""),
+                    other=item,
+                )
+                st.toast(f"已从浏览器入库：{result['document'].get('title', item.get('title', '未命名文章'))}")
+            except Exception as exc:
+                errors.append(f"{item.get('title', '未命名文章')}: {exc}")
+                upsert_wechat_failed_candidate(item, str(exc), keyword=keyword or item.get("keyword", ""))
+        if ok:
+            st.success(f"已从当前浏览器页补全文并入库 {ok} 篇。")
+            sync_kb_after_write()
+        if errors:
+            st.warning("\n".join(errors[:20]) + ("\n..." if len(errors) > 20 else ""))
 
 
 def sync_kb_after_write() -> None:
@@ -1182,6 +1225,53 @@ def render_knowledge_base() -> None:
             except Exception as exc:
                 st.error(f"采集正文入库失败：{exc}")
 
+        st.markdown("#### 本机浏览器抽取入库（可选增强）")
+        st.caption("用于替代反复粘贴正文：在本机 Chrome 打开公众号正文并通过验证后，工具通过 Chrome DevTools/web-access 类本机桥接读取真实页面 DOM。Streamlit Cloud 不能直接读取你电脑里的 Chrome，需本地运行或配置本机桥接服务。")
+        with st.popover("如何启动 Chrome 本机抽取"):
+            st.markdown("1. 关闭所有 Chrome 窗口，或使用一个单独的 Chrome 用户目录。")
+            st.code(r'start chrome --remote-debugging-port=9222 --user-data-dir="%TEMP%\industryscope-chrome"', language="powershell")
+            st.markdown("2. 在这个 Chrome 窗口里打开公众号文章，通过验证并停留在正文页。")
+            st.markdown("3. 回到 IndustryScope，保持下面地址为 `http://127.0.0.1:9222`，点击入库。")
+            st.markdown("4. 这个能力等价于 web-access / OpenCLI Browser Bridge 的思路：读取你已经打开的真实浏览器页面，不破解验证码。")
+        cdp_endpoint = st.text_input(
+            "Chrome DevTools / web-access 地址",
+            value=DEFAULT_CDP_ENDPOINT,
+            placeholder="http://127.0.0.1:9222 或 ws://127.0.0.1:9222/devtools/page/...",
+            key="wechat_cdp_endpoint",
+        )
+        col_browser_ingest1, col_browser_ingest2 = st.columns([1, 1])
+        with col_browser_ingest1:
+            browser_title_hint = st.text_input("当前浏览器页标题提示（可选）", value="", key="wechat_browser_title_hint")
+        with col_browser_ingest2:
+            browser_url_hint = st.text_input("当前浏览器页链接提示（可选）", value="", key="wechat_browser_url_hint")
+        if st.button("从当前 Chrome 公众号页抽取并入库", use_container_width=True):
+            try:
+                result = ingest_current_browser_wechat_article(
+                    cdp_endpoint.strip() or DEFAULT_CDP_ENDPOINT,
+                    keyword=wechat_keyword.strip() or browser_title_hint.strip(),
+                    industry_tags=wechat_industry_tags.strip() or wechat_keyword.strip() or browser_title_hint.strip(),
+                    company_tags=wechat_company_tags.strip(),
+                    technology_tags=wechat_technology_tags.strip(),
+                    url_hint=browser_url_hint.strip(),
+                    title_hint=browser_title_hint.strip(),
+                )
+                article = result.get("article", {})
+                if isinstance(article, dict):
+                    removed = remove_wechat_failed_candidate(
+                        url=article.get("url", ""),
+                        title=article.get("title", ""),
+                        account=article.get("account", ""),
+                        other=article,
+                    )
+                else:
+                    removed = 0
+                st.success(f"已从当前浏览器页入库：{result['document'].get('title', '未命名文章')}")
+                if removed:
+                    st.toast(f"已从待补全文队列移除 {removed} 条匹配文章。")
+                sync_kb_after_write()
+            except Exception as exc:
+                st.error(f"浏览器抽取入库失败：{exc}")
+
         st.markdown("#### 手动粘贴公众号全文入库")
         st.caption("备用流程：如果不想使用采集书签，也可以手动复制正文。这里粘贴的全文会作为真正的知识库证据；只保存候选链接的条目不会支撑报告强结论。")
         manual_full_title = st.text_input("文章标题", value="", key="manual_wechat_full_title")
@@ -1389,6 +1479,7 @@ def render_knowledge_base() -> None:
             company_tags=wechat_company_tags.strip(),
             technology_tags=wechat_technology_tags.strip(),
             browser_state=browser_state,
+            cdp_endpoint=cdp_endpoint.strip() or DEFAULT_CDP_ENDPOINT,
         )
 
         if st.button("入库手动粘贴的微信文章链接", use_container_width=True):

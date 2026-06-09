@@ -85,6 +85,22 @@ streamlit run app.py
 
 夸克网盘外部源：知识库页支持扫描夸克公开分享目录，适合 600MB/数百文件这类大批量资料，不再经过浏览器上传控件。公开分享通常可以枚举文件；若要服务器端下载原文并入库，可能需要在 Streamlit Secrets 中配置 `QUARK_COOKIE`。
 
+## 微信公众号正文增强
+
+公众号正文获取采用分层策略：先用公开 HTTP 抽取，失败后进入“待手动补全文队列”；用户也可以用 Chrome 书签采集、手动粘贴全文，或启用“本机浏览器抽取入库”。
+
+本机浏览器抽取借鉴 web-access / OpenCLI Browser Bridge 的思路：IndustryScope 通过 Chrome DevTools Protocol 读取你已经打开并通过验证的真实浏览器 DOM，不破解验证码，不绕过登录或付费限制。
+
+本地使用步骤：
+
+```powershell
+start chrome --remote-debugging-port=9222 --user-data-dir="%TEMP%\industryscope-chrome"
+```
+
+然后在这个 Chrome 窗口里打开公众号文章，通过验证并停留在正文页；回到知识库页，保持 `Chrome DevTools / web-access 地址` 为 `http://127.0.0.1:9222`，点击“从当前 Chrome 公众号页抽取并入库”。
+
+注意：Streamlit Cloud 服务器不能直接读取用户电脑上的 Chrome。这个能力适用于本地运行 IndustryScope，或未来配置本机 web-access/OpenCLI 代理桥接的场景；云端部署仍保留自动抽取、失败队列和书签采集流程。
+
 ## 设计文档
 
 工具的详细设计、参考报告分析和增强点见：
