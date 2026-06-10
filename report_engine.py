@@ -2075,10 +2075,12 @@ def build_knowledge_base_context(req: ReportRequest, per_chunk_chars: int = 1800
     query_parts = [
         req.industry,
         req.focus_questions,
-        "国内外厂商 技术路线 最新进展 融资 客户 产线 专利",
-        "行业拐点 商业化 先决条件 供应链成熟度 上游成熟度",
+        f"{req.industry} 厂商 技术路线 最新进展",
+        f"{req.industry} 专利 论文 产线 客户",
+        f"{req.industry} 行业拐点 商业化 供应链",
     ]
-    results = search_knowledge_base("\n".join(part for part in query_parts if part), top_k=req.kb_top_k)
+    kb_query = "\n".join(part for part in query_parts if part)
+    results = search_knowledge_base(kb_query, top_k=req.kb_top_k)
     sources = kb_results_to_sources(results)
     if not results:
         return "", []
@@ -2086,6 +2088,7 @@ def build_knowledge_base_context(req: ReportRequest, per_chunk_chars: int = 1800
         "专属知识库检索摘要：",
         f"- 使用模式：{req.knowledge_mode}",
         f"- 命中文档片段：{len(results)}",
+        f"- 检索行业门控：{req.industry}。若片段明显属于其他行业（例如硅光芯片报告中出现脑机接口/肌电手环材料），必须视为检索噪声并剔除，不得写入正文结论。",
         "- 使用原则：知识库材料可作为深度资料和私有调研证据；若与公开一手来源冲突，必须比较发布时间、来源类型、口径和证据强度，不得机械优先任一渠道。",
         "- 微信公众号候选线索规则：凡来源类型为“微信公众号候选线索”、标题含“候选线索”或正文写明“未能自动抓取全文”的片段，只代表搜索发现过这篇文章；模型没有读到全文，不得引用它支撑事实结论，只能放入待核验清单或用于生成后续检索关键词。",
     ]

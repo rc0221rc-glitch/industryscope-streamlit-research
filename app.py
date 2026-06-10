@@ -1861,6 +1861,7 @@ def render_knowledge_base() -> None:
                     "page": item.get("page"),
                     "section": item.get("section"),
                     "matched_terms": item.get("matched_terms"),
+                    "core_terms": item.get("core_terms"),
                 })
                 st.text_area("片段", value=item.get("text", ""), height=220, key=f"kb_chunk_{item.get('chunk_id')}")
 

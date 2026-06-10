@@ -571,6 +571,38 @@ def tokenize_query(text: str) -> list[str]:
     return [token for token in expanded if token not in stop]
 
 
+def kb_core_terms(query: str) -> set[str]:
+    text = (query or "").lower()
+    if any(term in text for term in ["硅光", "光芯片", "silicon photonic", "silicon photonics"]):
+        return {
+            "硅光", "硅光芯片", "硅光子", "光芯片", "光子集成", "光通信", "光模块",
+            "cpo", "co-packaged", "copackaged", "photonic", "photonics",
+            "silicon photonics", "optical transceiver",
+        }
+    if any(term in text for term in ["脑机", "bci", "brain-computer", "neural interface"]):
+        return {"脑机", "脑机接口", "bci", "brain-computer", "neuralink", "神经接口"}
+    if any(term in text for term in ["肌电", "emg", "semg"]):
+        return {"肌电", "emg", "semg", "electromyography", "电极", "腕带", "手环"}
+    if any(term in text for term in ["玻璃基板", "glass substrate", "glass core"]):
+        return {"玻璃基板", "玻璃通孔", "tgv", "glass substrate", "glass core", "advanced packaging"}
+
+    generic = {
+        "行业", "产业", "领域", "赛道", "研究", "报告", "市场", "分析", "技术", "路线",
+        "最新", "进展", "融资", "客户", "产线", "专利", "厂商", "公司", "国内外",
+        "商业化", "供应链", "成熟度", "上游", "the", "and", "for", "with", "market",
+        "industry", "technology", "company", "customer", "patent", "report",
+    }
+    terms = {term for term in tokenize_query(query) if term not in generic and len(term) >= 2}
+    noisy_fragments = {"技术", "路线", "最新", "进展", "融资", "客户", "产线", "专利", "厂商", "公司", "国内", "内外", "外厂", "术路", "新进", "户产", "业拐", "拐点", "商化", "条件", "供应", "应链", "成熟", "熟度", "上游"}
+    return {term for term in terms if term not in noisy_fragments}
+
+
+def kb_matches_core_terms(haystack: str, core_terms: set[str]) -> bool:
+    if not core_terms:
+        return True
+    return any(term.lower() in haystack for term in core_terms)
+
+
 def date_score(value: str) -> float:
     match = re.search(r"(20\d{2})", value or "")
     if not match:
@@ -589,6 +621,7 @@ def search_knowledge_base(query: str, top_k: int = 12, filters: dict[str, str] |
     if not query_tokens:
         return []
     query_terms = set(query_tokens)
+    core_terms = kb_core_terms(query)
     chunks = load_chunks()
     scored: list[dict[str, Any]] = []
     for chunk in chunks:
@@ -596,9 +629,12 @@ def search_knowledge_base(query: str, top_k: int = 12, filters: dict[str, str] |
             str(chunk.get(key, ""))
             for key in ["title", "source_org", "industry_tags", "company_tags", "technology_tags", "section", "text"]
         ).lower()
+        tag_haystack = f"{chunk.get('industry_tags', '')} {chunk.get('company_tags', '')} {chunk.get('technology_tags', '')}".lower()
         if filters.get("source_tier") and chunk.get("source_tier") != filters["source_tier"]:
             continue
         if filters.get("source_type") and chunk.get("source_type") != filters["source_type"]:
+            continue
+        if not kb_matches_core_terms(haystack, core_terms):
             continue
         hits = 0
         dense_hits = 0
@@ -612,14 +648,16 @@ def search_knowledge_base(query: str, top_k: int = 12, filters: dict[str, str] |
         coverage = hits / max(1, len(query_terms))
         phrase_bonus = 10.0 if query.lower() in haystack else 0.0
         title_bonus = 5.0 if any(term in str(chunk.get("title", "")).lower() for term in query_terms) else 0.0
-        tag_bonus = 4.0 if any(term in f"{chunk.get('industry_tags', '')} {chunk.get('company_tags', '')} {chunk.get('technology_tags', '')}".lower() for term in query_terms) else 0.0
-        score = coverage * 45 + math.log1p(dense_hits) * 10 + tier_score(str(chunk.get("source_tier", ""))) + date_score(str(chunk.get("publish_date", ""))) + phrase_bonus + title_bonus + tag_bonus
+        tag_bonus = 14.0 if any(term in tag_haystack for term in query_terms) else 0.0
+        core_bonus = 18.0 if any(term.lower() in tag_haystack for term in core_terms) else 6.0
+        score = coverage * 38 + math.log1p(dense_hits) * 8 + tier_score(str(chunk.get("source_tier", ""))) + date_score(str(chunk.get("publish_date", ""))) + phrase_bonus + title_bonus + tag_bonus + core_bonus
         if is_wechat_candidate_stub_record(chunk):
             score = max(1.0, score - 25.0)
         result = dict(chunk)
         result["score"] = round(score, 2)
         result["match_coverage"] = round(coverage, 2)
         result["matched_terms"] = ", ".join(sorted(term for term in query_terms if term in haystack)[:12])
+        result["core_terms"] = ", ".join(sorted(core_terms)[:12])
         scored.append(result)
     scored.sort(key=lambda item: item["score"], reverse=True)
     return scored[:top_k]
