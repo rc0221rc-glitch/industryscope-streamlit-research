@@ -7,7 +7,7 @@ import re
 import time
 from io import BytesIO
 from urllib.parse import parse_qs, quote, unquote, urlparse
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from datetime import datetime
 from typing import Any
 from xml.etree import ElementTree as ET
@@ -2835,7 +2835,8 @@ def sample_report(req: ReportRequest) -> tuple[str, list[dict[str, str]]]:
 def request_from_session(data: dict[str, Any]) -> ReportRequest:
     data = dict(data)
     data.pop("stance", None)
-    return ReportRequest(**data)
+    valid_fields = {field.name for field in fields(ReportRequest)}
+    return ReportRequest(**{key: value for key, value in data.items() if key in valid_fields})
 
 
 def request_to_json(req: ReportRequest) -> str:

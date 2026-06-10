@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import fields
 import json
 import os
 import re
@@ -46,6 +47,11 @@ from knowledge_base import (
 
 DEFAULT_CDP_ENDPOINT = "http://127.0.0.1:9222"
 DEFAULT_OPENCLI_COMMAND = "opencli"
+
+
+def make_report_request(**kwargs) -> ReportRequest:
+    valid_fields = {field.name for field in fields(ReportRequest)}
+    return ReportRequest(**{key: value for key, value in kwargs.items() if key in valid_fields})
 
 
 def load_browser_ingest_function(name: str):
@@ -564,7 +570,7 @@ def sidebar_request() -> tuple[ReportRequest, str, bool]:
         timeout_seconds = st.slider("请求超时", min_value=120, max_value=1800, value=900, step=60, help="长研报 + web search 可能需要更久。标准版建议 900 秒，深度版建议 1200-1800 秒。")
         demo_mode = st.toggle("无 Key 时使用示例模式", value=True)
 
-    request = ReportRequest(
+    request = make_report_request(
         provider=provider,
         industry=industry.strip(),
         region=region,
