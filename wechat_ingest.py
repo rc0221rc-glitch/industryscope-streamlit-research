@@ -9,9 +9,11 @@ import tempfile
 import time
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
+from xml.etree import ElementTree
 
 import requests
 from bs4 import BeautifulSoup
@@ -51,6 +53,7 @@ class WechatSearchResult:
     rank: int
     status: str = "候选"
     error: str = ""
+    relevance: int = 0
 
 
 @dataclass
@@ -68,13 +71,185 @@ def normalize_space(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def repair_mojibake(value: str) -> str:
+    """Repair common UTF-8-as-Latin-1 mojibake seen in Sogou snippets."""
+    text = value or ""
+    if not re.search(r"[ÃÂåæçèéä]", text):
+        return text
+    try:
+        repaired = bytes((ord(char) & 0xFF for char in text)).decode("utf-8", errors="replace")
+        return repaired if re.search(r"[\u4e00-\u9fff]", repaired) else text
+    except Exception:
+        return text
+
+
 def clean_text(text: str) -> str:
-    text = html.unescape(text or "")
+    text = repair_mojibake(html.unescape(text or ""))
+    text = re.sub(r"<!--red_beg-->|<!--red_end-->", "", text)
+    text = re.sub(r"<[^>]+>", " ", text)
     text = text.replace("\xa0", " ")
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r" *\n *", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def normalize_sogou_url(url: str) -> str:
+    decoded = clean_text(url).replace("&amp;", "&")
+    if decoded.startswith("//"):
+        return f"https:{decoded}"
+    if decoded.startswith("/"):
+        return urljoin("https://weixin.sogou.com", decoded)
+    return decoded
+
+
+def configured_wechat_feeds() -> list[str]:
+    raw = os.getenv("WECHAT_RSS_FEEDS", "")
+    parts = re.split(r"[,\n]", raw)
+    return [part.strip() for part in parts if re.match(r"^https?://", part.strip(), re.I)]
+
+
+def split_search_terms(value: str) -> list[str]:
+    text = value or ""
+    latin_terms = re.findall(r"[a-z0-9][a-z0-9.+-]{1,}", text.lower())
+    cjk_terms: list[str] = []
+    for term in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+        cjk_terms.extend(expand_cjk_term(term))
+    seen: set[str] = set()
+    terms: list[str] = []
+    for term in latin_terms + cjk_terms:
+        if term and term not in seen and not is_generic_term(term):
+            seen.add(term)
+            terms.append(term)
+    return terms
+
+
+def expand_cjk_term(term: str) -> list[str]:
+    cleaned = re.sub(r"行业|产业|领域|赛道|最新|新闻|要闻|公司|企业", "", term or "")
+    if not cleaned:
+        return []
+    if len(cleaned) <= 4:
+        return [cleaned]
+    parts = [cleaned]
+    parts.extend(cleaned[idx:idx + 2] for idx in range(0, len(cleaned) - 1))
+    return parts
+
+
+def is_generic_term(term: str) -> bool:
+    return term.lower() in {
+        "行业", "产业", "领域", "赛道", "最新", "新闻", "要闻", "公司", "企业",
+        "market", "industry", "latest", "news", "technology", "policy", "update", "company",
+    }
+
+
+def build_wechat_search_profile(keyword: str) -> dict[str, Any]:
+    raw = normalize_space(keyword)
+    canonical = re.sub(r"行业|产业|领域|赛道|公司|企业|最新|新闻|要闻", "", raw).strip() or raw
+    aliases = {canonical, raw}
+    exact_terms: set[str] = set()
+    text = f"{raw} {canonical}"
+
+    if re.search(r"脑机|bci|brain.?computer|neuralink|侵入式|非侵入式", text, re.I):
+        aliases.update([
+            "脑机接口",
+            "脑机接口行业",
+            "BCI",
+            "brain-computer interface",
+            "brain computer interface",
+            "neural interface",
+            "neurotechnology",
+            "Neuralink",
+        ])
+    if re.search(r"澜昆微|lankun", text, re.I):
+        for term in ["澜昆微", "澜昆微电子", "上海澜昆微电子", "上海澜昆微电子科技有限公司", "Lankun Micro"]:
+            aliases.add(term)
+            exact_terms.add(term)
+
+    required_terms: list[str] = []
+    for alias in aliases:
+        required_terms.extend(split_search_terms(alias))
+    return {
+        "canonical": canonical,
+        "aliases": [item for item in dict.fromkeys(aliases) if item],
+        "exact_terms": [item for item in dict.fromkeys(exact_terms) if item],
+        "required_terms": [item for item in dict.fromkeys(required_terms) if item],
+    }
+
+
+def build_sogou_weixin_queries(keyword: str) -> list[str]:
+    profile = build_wechat_search_profile(keyword)
+    queries = [item for item in [*profile["exact_terms"], profile["canonical"], *profile["aliases"]] if re.search(r"[\u4e00-\u9fff]", item)]
+    return list(dict.fromkeys(queries or [keyword]))[:3]
+
+
+def wechat_relevance_score(title: str, snippet: str, account: str, keyword: str) -> int:
+    profile = build_wechat_search_profile(keyword)
+    text = normalize_space(f"{title} {snippet} {account}").lower()
+    title_text = normalize_space(title).lower()
+    account_text = normalize_space(account).lower()
+    snippet_text = normalize_space(snippet).lower()
+    score = 42
+    exact_snippet_only = False
+
+    if profile["exact_terms"]:
+        exact_title_hit = any(term.lower() in title_text or term.lower() in account_text for term in profile["exact_terms"])
+        exact_snippet_hit = any(term.lower() in snippet_text for term in profile["exact_terms"])
+        if not exact_title_hit and not exact_snippet_hit:
+            return -100
+        if exact_title_hit:
+            score += 34
+        else:
+            # Company-only mentions buried in snippets are useful clues, but often weak listicle mentions.
+            exact_snippet_only = True
+            score -= 18
+
+    alias_hit = any(len(alias) > 1 and alias.lower() in text for alias in profile["aliases"])
+    alias_title_hit = any(len(alias) > 1 and alias.lower() in title_text for alias in profile["aliases"])
+    required_hits = [term for term in profile["required_terms"] if term.lower() in text]
+    if alias_title_hit:
+        score += 24
+    elif alias_hit:
+        score += 24
+    elif len(required_hits) >= min(2, max(1, len(profile["required_terms"]))):
+        score += 12
+    else:
+        return -30
+
+    for term in profile["required_terms"]:
+        term_l = term.lower()
+        if term_l in title_text:
+            score += 12
+        elif term_l in text:
+            score += 5
+
+    if re.search(r"调研纪要|专家纪要|专家访谈|电话会|交流纪要|路演纪要|产业链调研|机构调研|投资者交流|纪要全文|研报翻译|海外研报|摘译|投行|券商", text, re.I):
+        score += 18
+    if re.search(r"goldman|高盛|morgan stanley|摩根士丹利|j\.?p\.? morgan|摩根大通|bernstein|伯恩斯坦|semianalysis|semi analysis|yole|omdia|gartner|idc|trendforce|techinsights", text, re.I):
+        score += 14
+    if re.search(r"涨停|牛股|妖股|翻倍|财富密码|封神|炸裂|仅用\d+天|全民.*时代|到底在急什么|大消息|重磅利好|付费|课程|训练营|社群|招商|广告", text, re.I):
+        score -= 28
+    if re.search(r"低估|收藏|名单|概念|行情|赶紧|太狠|硬核公司|附名单|龙头", title_text, re.I):
+        score -= 34
+    if len(title_text) > 70:
+        score -= 6
+    if exact_snippet_only:
+        cap = 45 if re.search(r"调研|纪要|访谈|电话会|投融资|融资|发布|首发|客户|验证|量产", text, re.I) else 35
+        score = min(score, cap)
+    return score
+
+
+def is_relevant_wechat_result(title: str, snippet: str, account: str, keyword: str) -> bool:
+    return wechat_relevance_score(title, snippet, account, keyword) >= 20
+
+
+def wechat_relevance_band(score: int) -> int:
+    if score >= 60:
+        return 3
+    if score >= 36:
+        return 2
+    if score >= 20:
+        return 1
+    return 0
 
 
 def ensure_wechat_cache_dirs() -> None:
@@ -160,6 +335,162 @@ def extract_sogou_date(li: Any) -> tuple[str, int]:
         except ValueError:
             return date, 0
     return "", 0
+
+
+def extract_sogou_date_from_block(block: str) -> tuple[str, int]:
+    match = re.search(r"timeConvert\(['\"]?(\d{9,11})['\"]?\)", block or "", re.I)
+    if match:
+        return timestamp_to_date(match.group(1))
+    clean_block = clean_text(block)
+    match = re.search(r"\b(20\d{2}[-/.年]\d{1,2}[-/.月]\d{1,2})", clean_block)
+    if match:
+        date = match.group(1).replace("年", "-").replace("月", "-").replace("/", "-").replace(".", "-").strip("-")
+        try:
+            parsed = datetime.strptime(date, "%Y-%m-%d")
+            return parsed.strftime("%Y-%m-%d"), int(parsed.timestamp())
+        except ValueError:
+            return date, 0
+    return "", 0
+
+
+def parse_sogou_weixin(html_text: str, keyword: str, start_rank: int = 0) -> list[WechatSearchResult]:
+    blocks = re.findall(r"<li[^>]+id=[\"']sogou_vr_11002601_box_\d+[\"'][\s\S]*?</li>", html_text or "", re.I)
+    if not blocks:
+        soup = BeautifulSoup(html_text or "", "html.parser")
+        blocks = [str(item) for item in soup.select("ul.news-list li")]
+
+    results: list[WechatSearchResult] = []
+    for index, block in enumerate(blocks, start=1):
+        title_match = re.search(
+            r"<a[^>]+id=[\"']sogou_vr_11002601_title_\d+[\"'][^>]*href=[\"']([^\"']+)[\"'][^>]*>([\s\S]*?)</a>",
+            block,
+            re.I,
+        )
+        fallback_title_match = re.search(r"<h3>\s*<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>([\s\S]*?)</a>", block, re.I)
+        match = title_match or fallback_title_match
+        if not match:
+            continue
+        raw_href, raw_title = match.group(1), match.group(2)
+        title = normalize_space(clean_text(raw_title))
+        if not title or not raw_href:
+            continue
+
+        raw_summary = ""
+        summary_match = re.search(r"<p[^>]+class=[\"']txt-info[\"'][^>]*>([\s\S]*?)</p>", block, re.I)
+        if summary_match:
+            raw_summary = summary_match.group(1)
+        account_match = re.search(r"<span[^>]+class=[\"']all-time-y2[\"'][^>]*>([\s\S]*?)</span>", block, re.I)
+        account = normalize_space(clean_text(account_match.group(1) if account_match else ""))
+        published_at, published_ts = extract_sogou_date_from_block(block)
+        snippet = normalize_space(clean_text(raw_summary))
+        relevance = wechat_relevance_score(title, snippet, account, keyword)
+        if relevance >= 60:
+            status = "微信强相关候选"
+        elif relevance >= 36:
+            status = "微信补充候选"
+        elif relevance >= 20:
+            status = "微信弱相关候选"
+        else:
+            status = "弱相关候选"
+
+        results.append(
+            WechatSearchResult(
+                title=title,
+                search_url=normalize_sogou_url(raw_href),
+                url="",
+                account=account,
+                published_at=published_at,
+                published_ts=published_ts,
+                snippet=snippet,
+                rank=start_rank + index,
+                status=status,
+                relevance=relevance,
+            )
+        )
+    return results
+
+
+def parse_feed_date(value: str) -> tuple[str, int]:
+    if not value:
+        return "", 0
+    try:
+        parsed = parsedate_to_datetime(value)
+        return parsed.strftime("%Y-%m-%d"), int(parsed.timestamp())
+    except Exception:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.strftime("%Y-%m-%d"), int(parsed.timestamp())
+        except Exception:
+            return "", 0
+
+
+def parse_wechat_rss_feed(xml_text: str, feed_url: str, keyword: str, start_rank: int = 0) -> list[WechatSearchResult]:
+    try:
+        root = ElementTree.fromstring(xml_text)
+    except Exception:
+        return []
+
+    def local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1].lower()
+
+    items = [node for node in root.iter() if local_name(node.tag) in {"item", "entry"}]
+    results: list[WechatSearchResult] = []
+    for index, item in enumerate(items[:30], start=1):
+        values: dict[str, str] = {}
+        for child in list(item):
+            name = local_name(child.tag)
+            if name == "link":
+                values.setdefault("link", child.attrib.get("href") or (child.text or ""))
+            elif name in {"title", "description", "summary", "content", "pubdate", "published", "updated", "source"}:
+                values.setdefault(name, child.text or "")
+        title = normalize_space(clean_text(values.get("title", "")))
+        url = normalize_sogou_url(values.get("link", ""))
+        snippet = normalize_space(clean_text(values.get("description") or values.get("summary") or values.get("content") or ""))
+        if not title or not url:
+            continue
+        published_at, published_ts = parse_feed_date(values.get("pubdate") or values.get("published") or values.get("updated") or "")
+        account = normalize_space(clean_text(values.get("source", ""))) or urlparse(feed_url).netloc.lower().removeprefix("www.")
+        relevance = wechat_relevance_score(title, snippet, account, keyword) + 8
+        if relevance < 20:
+            continue
+        results.append(
+            WechatSearchResult(
+                title=title,
+                search_url=url,
+                url=url,
+                account=account,
+                published_at=published_at,
+                published_ts=published_ts,
+                snippet=snippet,
+                rank=start_rank + index,
+                status="白名单RSS候选",
+                relevance=relevance,
+            )
+        )
+    return results
+
+
+def fetch_configured_wechat_feeds(keyword: str, limit: int = 10, start_rank: int = 0) -> list[WechatSearchResult]:
+    feeds = configured_wechat_feeds()
+    if not feeds:
+        return []
+    session = make_sogou_session()
+    results: list[WechatSearchResult] = []
+    rank = start_rank
+    for feed_url in feeds:
+        try:
+            response = request_with_backoff(session, feed_url, timeout=10, allow_redirects=True, max_retries=2, base_delay=1.5)
+            response.raise_for_status()
+            items = parse_wechat_rss_feed(response.text, feed_url, keyword, start_rank=rank)
+        except Exception:
+            continue
+        for item in items:
+            rank += 1
+            item.rank = rank
+            results.append(item)
+            if len(results) >= limit:
+                return results
+    return results
 
 
 def restore_sogou_redirect_url(script_html: str) -> str:
@@ -374,7 +705,8 @@ def search_sogou_wechat(
     cache_ttl_days: int = 1,
     min_delay_seconds: float = 2.0,
 ) -> list[WechatSearchResult]:
-    cache_file = cache_path(SEARCH_CACHE_DIR, cache_key(f"{keyword}|{limit}|{pages}"))
+    queries = build_sogou_weixin_queries(keyword)
+    cache_file = cache_path(SEARCH_CACHE_DIR, cache_key(f"sogou-weixin-v2|{keyword}|{limit}|{pages}|{'|'.join(queries)}"))
     cached = read_cache(cache_file, cache_ttl_days)
     if cached:
         return [WechatSearchResult(**item) for item in cached]
@@ -384,65 +716,63 @@ def search_sogou_wechat(
     seen: set[str] = set()
     rank = 0
 
-    for page in range(1, max(1, pages) + 1):
-        response = request_with_backoff(
-            session,
-            SOGOU_WECHAT_URL,
-            params={
-                "type": "2",
-                "query": keyword,
-                "ie": "utf8",
-                "s_from": "input",
-                "_sug_": "n",
-                "_sug_type_": "",
-                "page": str(page),
-            },
-            timeout=12,
-            allow_redirects=True,
-            max_retries=3,
-            base_delay=max(2.0, min_delay_seconds),
-        )
-        response.raise_for_status()
-        if "请输入验证码" in response.text or "antispider" in response.url or "antispider" in response.text:
-            raise RuntimeError("搜狗微信搜索触发验证码/反爬验证，请稍后重试或减少搜索频率。")
-        soup = BeautifulSoup(response.text, "html.parser")
-        items = soup.select("ul.news-list li")
-        if not items:
-            break
-        for li in items:
-            anchor = li.select_one("h3 a") or li.select_one("a")
-            if not anchor:
-                continue
-            title = normalize_space(anchor.get_text(" ", strip=True))
-            href = anchor.get("href", "")
-            search_url = urljoin("https://weixin.sogou.com", href)
-            snippet_node = li.select_one(".txt-info")
-            snippet = normalize_space(snippet_node.get_text(" ", strip=True) if snippet_node else "")
-            account_node = li.select_one(".all-time-y2") or li.select_one(".account")
-            account = normalize_space(account_node.get_text(" ", strip=True) if account_node else "")
-            published_at, published_ts = extract_sogou_date(li)
-            dedupe_key = href or title
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            rank += 1
-            results.append(
-                WechatSearchResult(
-                    title=title,
-                    search_url=search_url,
-                    url="",
-                    account=account,
-                    published_at=published_at,
-                    published_ts=published_ts,
-                    snippet=snippet,
-                    rank=rank,
-                )
+    for query in queries:
+        for page in range(1, max(1, pages) + 1):
+            response = request_with_backoff(
+                session,
+                SOGOU_WECHAT_URL,
+                params={
+                    "type": "2",
+                    "query": query,
+                    "ie": "utf8",
+                    "s_from": "input",
+                    "_sug_": "n",
+                    "_sug_type_": "",
+                    "page": str(page),
+                },
+                timeout=12,
+                allow_redirects=True,
+                max_retries=3,
+                base_delay=max(2.0, min_delay_seconds),
             )
-        if len(results) >= limit:
+            response.raise_for_status()
+            if "请输入验证码" in response.text or "antispider" in response.url or "antispider" in response.text:
+                raise RuntimeError("搜狗微信搜索触发验证码/反爬验证，请稍后重试或减少搜索频率。")
+            parsed_items = parse_sogou_weixin(response.text, keyword=query, start_rank=rank)
+            if not parsed_items:
+                break
+            for item in parsed_items:
+                dedupe_key = normalize_space(item.search_url or item.url or item.title).lower()
+                title_key = normalize_space(item.title).lower()
+                if not dedupe_key or dedupe_key in seen or title_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                seen.add(title_key)
+                rank += 1
+                item.rank = rank
+                if item.relevance < 20:
+                    item.status = "弱相关降权"
+                results.append(item)
+            if len(results) >= limit * 2:
+                break
+            time.sleep(max(1.0, min_delay_seconds))
+        if len(results) >= limit * 2:
             break
-        time.sleep(max(1.0, min_delay_seconds))
 
-    results = sorted(results, key=lambda item: (item.published_ts, -item.rank), reverse=True)
+    for item in fetch_configured_wechat_feeds(keyword, limit=limit, start_rank=rank):
+        dedupe_key = normalize_space(item.search_url or item.url or item.title).lower()
+        title_key = normalize_space(item.title).lower()
+        if dedupe_key and dedupe_key not in seen and title_key not in seen:
+            seen.add(dedupe_key)
+            seen.add(title_key)
+            results.append(item)
+
+    results = [item for item in results if item.relevance >= 20]
+    results = sorted(
+        results,
+        key=lambda item: (wechat_relevance_band(item.relevance), item.published_ts, item.relevance, -item.rank),
+        reverse=True,
+    )
     results = results[:limit]
     write_cache(cache_file, [asdict(item) for item in results])
     return results
@@ -645,6 +975,8 @@ def candidate_to_markdown(candidate: dict[str, Any], keyword: str, error: str = 
             f"- 发布日期：{candidate.get('published_at') or '未识别'}",
             f"- 搜索关键词：{keyword}",
             f"- 搜索排序：{candidate.get('rank') or '未记录'}",
+            f"- 相关性分数：{candidate.get('relevance') if candidate.get('relevance') not in [None, ''] else '未记录'}",
+            f"- 候选状态：{candidate.get('status') or '候选'}",
             "- 入库状态：候选线索，未能自动抓取全文",
             f"- 抓取失败原因：{error or candidate.get('error') or '未记录'}",
             "- 来源说明：由 IndustryScope 通过搜狗微信搜索发现。该文档只保存标题、摘要和候选链接，作为待补全文线索；不得单独支撑市场规模、份额、融资、订单、财务或全球第一等强结论。",

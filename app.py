@@ -1702,13 +1702,14 @@ def render_knowledge_base() -> None:
                     "公众号": item.get("account", ""),
                     "日期": item.get("published_at", "") or "未识别",
                     "状态": item.get("status", "候选"),
+                    "相关性": item.get("relevance", ""),
                     "摘要": item.get("snippet", ""),
                 })
             edited = st.data_editor(
                 rows,
                 use_container_width=True,
                 hide_index=True,
-                disabled=["序号", "标题", "打开", "公众号", "日期", "状态", "摘要"],
+                disabled=["序号", "标题", "打开", "公众号", "日期", "状态", "相关性", "摘要"],
                 column_config={
                     "打开": st.column_config.LinkColumn("打开", display_text="打开文章"),
                     "摘要": st.column_config.TextColumn("摘要", width="large"),
